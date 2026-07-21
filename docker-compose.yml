@@ -1,0 +1,21 @@
+services:
+  jltamp-server:
+    build: .
+    container_name: jltamp-server
+    restart: unless-stopped
+    ports:
+      # host:container — 32400 mirrors Plex's default so nothing else changes.
+      - "32400:32400"
+    environment:
+      JLTAMP_USERNAME: "admin"
+      JLTAMP_PASSWORD: "changeme"
+      SERVER_NAME: "JLTamp"
+      RESCAN_INTERVAL_MIN: "0"
+    volumes:
+      # ── EDIT THIS: point the left side at your music folder on the server ──
+      - /path/to/your/music:/music:ro
+      # Persistent server data (SQLite DB + artwork cache). Survives rebuilds.
+      - jltamp-data:/data
+
+volumes:
+  jltamp-data:

@@ -1,0 +1,35 @@
+[Unit]
+Description=llama.cpp embedding server (bge-m3) for JLTamp AI
+After=network.target
+
+[Service]
+Type=simple
+User=USER
+Group=USER
+WorkingDirectory=/home/USER/jltamp-ai
+
+# Bound to 127.0.0.1: only the AI service on this host needs it, and an
+# embedding endpoint open to the network is free GPU time for anyone who
+# finds it.
+ExecStart=/home/USER/llama.cpp/build/bin/llama-server \
+    -m /home/USER/llama.cpp/models/bge-m3-Q8_0.gguf \
+    --embedding \
+    --pooling mean \
+    --port 3100 \
+    --host 127.0.0.1 \
+    --n-gpu-layers 999 \
+    --ctx-size 8192 \
+    --batch-size 2048 \
+    --ubatch-size 2048 \
+    --log-verbosity 0
+
+Restart=on-failure
+RestartSec=10
+# A cold model load on the Xavier takes ~10s; allow generously for a busy boot.
+TimeoutStartSec=180
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

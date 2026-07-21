@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Runtime data (SQLite DB, extracted/cached artwork, transcode temp)
+data/*.db
+data/*.db-*
+data/cache/
+data/artwork/
+*.log
+
+# Env
+.env
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Local test artefacts
+/testmusic/
+/data_test/
+/server.log

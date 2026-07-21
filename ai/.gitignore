@@ -1,0 +1,16 @@
+# Secrets — never commit
+.env
+
+# Generated vectors and index (hundreds of MB, rebuildable)
+data/
+*.npy
+*.npy.resize
+
+# Audio feature cache
+track_features.json
+
+logs/
+__pycache__/
+*.pyc
+venv/
+.venv/
