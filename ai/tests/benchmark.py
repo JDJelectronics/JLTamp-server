@@ -81,9 +81,16 @@ CASES = [
      looks_dutch, 0.7),
     ("nederlandse pop",
      looks_dutch, 0.7),
+    # A focus track is instrumental or calm; that it also reads as "sleep" or
+    # "relax" music does not disqualify it. The earlier list missed exactly the
+    # right answers — "Sleep Fruits Music - Music to Focus" scored as a miss —
+    # so a good playlist looked like a regression. Judge on tempo too: nothing
+    # over ~110 BPM is focus music, however it is tagged.
     ("instrumentale focus muziek om bij te werken",
-     lambda t: has_any(t, ["instrumental", "focus", "concentrat", "study", "lofi",
-                           "ambient", "piano", "calm", "background", "work"]), 0.5),
+     lambda t: (has_any(t, ["instrumental", "focus", "concentrat", "study",
+                            "lofi", "ambient", "piano", "calm", "rustig",
+                            "sleep", "slaap", "relax", "background", "meditat"])
+                or (t.features.get("bpm") and t.features["bpm"] <= 110)), 0.5),
     ("jaren 80 hits",
      lambda t: in_years(t, 1980, 1989), 0.9),
     ("jaren 90 dance",

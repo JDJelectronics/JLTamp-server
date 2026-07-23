@@ -46,8 +46,11 @@ def main() -> int:
         wanted = [g.strip().lower() for g in args.only.split(",")]
         cases = [(g, counts.get(g, 0)) for g in wanted]
     else:
-        cases = [(g, n) for g, n in counts.most_common(args.top * 2)
-                 if n >= MIN_TRACKS][:args.top]
+        # A comma in the tag means it is a pile of genres ("rock, hard rock,
+        # metal"), not one a user would type. Testing those as if they were a
+        # single genre is meaningless — nobody asks for that exact string.
+        cases = [(g, n) for g, n in counts.most_common(args.top * 3)
+                 if n >= MIN_TRACKS and "," not in g][:args.top]
 
     print(f"{len(tracks)} tracks · {len(counts)} genres · testing {len(cases)}\n")
 

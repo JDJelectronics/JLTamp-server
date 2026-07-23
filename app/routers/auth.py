@@ -26,7 +26,7 @@ router = APIRouter()
 
 
 # ── brute-force protection ───────────────────────────────────────────────────
-# The server is reachable from the public internet, so the login
+# The server is reachable from the public internet (your-domain.example), so the login
 # endpoint is exposed to anyone who wants to guess passwords at it. Unlimited
 # tries turn any weak password into a matter of time.
 #
@@ -38,8 +38,8 @@ FAIL_WINDOW = 900        # failures are counted over 15 minutes
 # The IP limit is the real defence: an attacker guesses from somewhere, and 5
 # tries per quarter of an hour makes guessing hopeless. The per-ACCOUNT limit is
 # deliberately much higher, because a strict one is a weapon *against* the user:
-# anyone could lock a user out of their own server by typing their password wrong
-# 5 times from a café. It exists only to stop a botnet spreading tries over many
+# anyone could lock Admin out of his own server by typing his password wrong 5
+# times from a café. It exists only to stop a botnet spreading tries over many
 # IPs against one account.
 FAIL_LIMIT_IP = 5
 FAIL_LIMIT_ACCOUNT = 30
@@ -171,7 +171,7 @@ def _find_login_user(db, identifier: str) -> User | None:
     u = db.query(User).filter(User.email == norm_email(ident)).first()
     if u:
         return u
-    # legacy username → the admin account (so the legacy username still works)
+    # legacy username → the admin account (so "admin" still works)
     if ident.lower() == config.USERNAME.lower():
         return db.query(User).filter(User.is_admin == True).order_by(User.id).first()  # noqa: E712
     # display name match (fallback)

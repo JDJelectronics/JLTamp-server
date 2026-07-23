@@ -110,13 +110,32 @@ class JLTampClient:
         self.url = (url or config.JLTAMP_URL).rstrip("/")
         self._token = token or config.JLTAMP_TOKEN
         self._lock = threading.Lock()
-        self.session = requests.Session()
-        # Retry only idempotent reads; a retried playlist POST would duplicate it.
-        retries = Retry(total=3, backoff_factor=1,
+        self.session = self._make_session()
+
+    @staticmethod
+    def _make_session() -> requests.Session:
+        s = requests.Session()
+        # Retry only idempotent reads; a retried playlist POST would duplicate
+        # it. A dead keep-alive socket the server closed while we were idle is a
+        # connection error, so retrying READ re-opens a fresh one rather than
+        # hanging on the read timeout — the weekly job sat idle between calls
+        # and paid a 60 s+ stall on the first stale socket without this.
+        retries = Retry(total=3, backoff_factor=0.5, connect=3, read=2,
                         status_forcelist=[502, 503, 504],
                         allowed_methods=["GET"])
-        self.session.mount("http://", HTTPAdapter(max_retries=retries))
-        self.session.mount("https://", HTTPAdapter(max_retries=retries))
+        adapter = HTTPAdapter(max_retries=retries)
+        s.mount("http://", adapter)
+        s.mount("https://", adapter)
+        return s
+
+    def refresh_connection(self) -> None:
+        """Drop pooled sockets and start fresh. Called before a batch job that
+        has been idle long enough for the server to have closed keep-alive."""
+        try:
+            self.session.close()
+        except Exception:                            # noqa: BLE001
+            pass
+        self.session = self._make_session()
 
     # ── auth ─────────────────────────────────────────────────────────────────
     def _headers(self) -> dict:
@@ -147,6 +166,29 @@ class JLTampClient:
             raise JLTampError("JLTamp login returned no token.")
         self._token = token
         return token
+
+    def list_users(self) -> list[dict]:
+        """All JLTamp users. Needs the admin account — used by the weekly job
+        to know who to build playlists for."""
+        data = self._get("/admin/users")
+        return data.get("users", []) if isinstance(data, dict) else []
+
+    def session_for(self, user_id: int) -> str | None:
+        """Mint a session token for another user (admin only).
+
+        The weekly playlists run as a background job with no user logged in, so
+        the engine asks JLTamp — as admin — for a token per user, then acts as
+        that user. Returns None if the endpoint is absent (server not yet
+        deployed) or the user is gone, so the caller can skip rather than crash.
+        """
+        try:
+            r = self.session.post(f"{self.url}/admin/users/{user_id}/session",
+                                  headers=self._headers(), timeout=20)
+        except requests.RequestException:
+            return None
+        if r.status_code != 200:
+            return None
+        return (r.json() or {}).get("token")
 
     def me(self) -> dict | None:
         """Who this token belongs to, or None if JLTamp rejects it.
@@ -304,6 +346,15 @@ class JLTampClient:
         for i in ids:
             out.add(str(i.get("ratingKey")) if isinstance(i, dict) else str(i))
         return out
+
+    def most_played_ids(self, limit: int = 60) -> list[str]:
+        """This user's most-played track keys — the core of their taste."""
+        try:
+            data = self._get("/history/mostPlayed", type=10, limit=limit)
+        except requests.HTTPError:
+            return []
+        items = data.get("MediaContainer", {}).get("Metadata", []) or []
+        return [str(m.get("ratingKey")) for m in items if m.get("ratingKey")]
 
     def skip_counts(self, days: int = 90, max_events: int = 5000) -> dict[str, int]:
         """How often each track was abandoned early.

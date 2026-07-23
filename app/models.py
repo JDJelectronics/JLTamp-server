@@ -62,7 +62,7 @@ class Session(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     created_at: Mapped[int] = mapped_column(Integer, default=0)
     last_seen_at: Mapped[int] = mapped_column(Integer, default=0)
-    label: Mapped[str] = mapped_column(String, default="")  # e.g. "web", "mobile"
+    label: Mapped[str] = mapped_column(String, default="")  # e.g. "web", "android"
 
 
 # ── Libraries (Plex-style, admin-managed) ────────────────────────────────────

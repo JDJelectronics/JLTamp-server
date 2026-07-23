@@ -6,20 +6,20 @@ it sits at 109 BPM. Prompts like "gym" or "slapen" are really about tempo and
 energy, so the scorer reads these measurements (see scoring.AUDIO_TARGETS).
 
 ⛔ READ-ONLY. This opens audio files and never writes to them. Its only output
-is the JSON cache, which lives outside the music directory. Treat the music
-library as read-only — it is the user's irreplaceable collection.
+is the JSON cache, which lives outside the music directory. The music library
+is the user's irreplaceable collection — see server/CLAUDE.md.
 
 Two ways to reach the audio, in order of preference:
 
   1. Local files. Fastest by far (~0.6 s/track). JLTamp reports container paths
      (/music/mp3/...), so map them to what this machine can see:
-         MUSIC_PATH_MAP=/music/mp3:/path/on/this/host/mp3,/music/flac:/path/on/this/host/flac
+         MUSIC_PATH_MAP=/music/mp3:/path/to/your/music,/music/flac:/path/to/your/flac
      Run this on the server that has the mounts.
 
   2. Streaming over the API. Works anywhere, but downloading ~9 MB per track
      dominates the cost (~2.9 s/track). Enable with AUDIO_ALLOW_STREAM=1.
 
-Concurrency is capped hard: measured on your server, 2 worker processes finish
+Concurrency is capped hard: measured on your-server, 2 worker processes finish
 every track and 3 kill the pool outright (numba inside a process pool). Scale
 out with several containers instead, each taking a shard — separate processes
 cannot take each other down:
@@ -135,7 +135,7 @@ def analyse_one(job: tuple[str, str, str, str]) -> tuple[str, dict | None, str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    # Two, not more: measured on your server, 2 workers completes every track and
+    # Two, not more: measured on your-server, 2 workers completes every track and
     # 3 kills the pool outright. Scale out with several containers instead —
     # separate processes cannot take each other down.
     ap.add_argument("--workers", type=int, default=2)

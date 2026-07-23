@@ -11,7 +11,15 @@ network drive it.
 """
 from __future__ import annotations
 
+import faulthandler
+import signal
 import subprocess
+import threading as _threading
+import time as _time
+
+# SIGUSR1 dumps every thread's stack to stderr — the definitive
+# way to see where a hang actually is, no root needed.
+faulthandler.register(signal.SIGUSR1, all_threads=True)
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -54,13 +62,37 @@ def _authenticate():
     return None
 
 
+# Cached, because computing it forks a subprocess. Forking from a request
+# thread while another thread runs numpy (a weekly build, say) is the classic
+# multithreaded-fork deadlock: the child inherits a held malloc lock and hangs,
+# and the parent blocks forever in _execute_child. /health is called often and
+# the address never changes, so fork once and reuse — the hot path never forks.
+_ts_ip: str | None = None
+_ts_ip_at = 0.0
+_ts_lock = _threading.Lock()
+_TS_TTL = 3600
+
+
 def _tailscale_ip() -> str | None:
+    global _ts_ip, _ts_ip_at
+    now = _time.time()
+    if _ts_ip is not None and now - _ts_ip_at < _TS_TTL:
+        return _ts_ip
+    # One fork at a time, and never while holding up other requests longer
+    # than necessary — a stale value is fine until the refresh completes.
+    if not _ts_lock.acquire(blocking=False):
+        return _ts_ip
     try:
         out = subprocess.check_output(["/usr/bin/tailscale", "ip", "-4"],
                                       text=True, timeout=5)
+        _ts_ip = next((l.strip() for l in out.splitlines()
+                       if l.strip().startswith("100.")), None)
+        _ts_ip_at = now
     except (OSError, subprocess.SubprocessError):
-        return None
-    return next((l.strip() for l in out.splitlines() if l.strip().startswith("100.")), None)
+        pass
+    finally:
+        _ts_lock.release()
+    return _ts_ip
 
 
 # Two paths, one handler. When the service is reached directly, /health is the
@@ -139,6 +171,19 @@ def playlist():
     job_id = jobs.submit(guard, lambda _g: engine.handle(prompt, token))
     return jsonify({"status": "processing", "job_id": job_id,
                     "poll_interval": 1000, "timeout": config.JOB_TIMEOUT_SEC * 1000})
+
+
+@app.post("/ai/weekly")
+def weekly():
+    """Build the weekly per-user playlists now. Admin token required — this
+    acts on every user's library, so it must not be open to any caller."""
+    token = _caller_token()
+    ctx = engine.user_context(token)
+    if not ctx or not (ctx["user"].get("isAdmin") or ctx["user"].get("is_admin")):
+        return jsonify({"error": "admin token required"}), 403
+    only = request.args.get("user_id", type=int)
+    results = engine.generate_weekly(only_user_id=only)
+    return jsonify({"results": results})
 
 
 @app.get("/ai/status")

@@ -1,15 +1,15 @@
 [Unit]
 Description=JLTamp AI — semantic playlist engine
-Documentation=https://github.com/JDJelectronics/JLTamp-server/blob/main/ai/README.md
+Documentation=https://github.com/JDJelectronics/JLTamp/blob/main/ai/README.md
 After=network-online.target jltamp-embed.service
 Wants=network-online.target
 Requires=jltamp-embed.service
 
 [Service]
 Type=simple
-User=USER
-Group=USER
-WorkingDirectory=/home/USER/jltamp-ai
+User=jlt
+Group=jlt
+WorkingDirectory=/home/USER/jltamp/ai
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 -m app.main
 Restart=on-failure
@@ -21,7 +21,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/USER/jltamp-ai/data /home/USER/jltamp-ai/logs
+ReadWritePaths=/home/USER/jltamp/ai/data /home/USER/jltamp/ai/logs
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true

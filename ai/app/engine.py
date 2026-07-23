@@ -14,7 +14,7 @@ import time
 
 import numpy as np
 
-from . import config, scoring
+from . import config, genre_infer, scoring
 from .embed_client import EmbedClient, EmbedError
 from .embed_store import DimensionMismatch, EmbeddingStore
 from .jltamp_client import JLTampClient, JLTampError, Library, Track
@@ -47,6 +47,13 @@ class Engine:
         self._users_lock = threading.Lock()
         # Maintained by the embed worker so /health stays O(1).
         self._stale_count = 0
+        # {rating_key: genre} guessed from embedding neighbours for untagged
+        # tracks. Loaded from disk, recomputed by the embed worker once the
+        # vectors it needs exist. Overlaid onto a snapshot, never persisted
+        # into JLTamp — a guess must not masquerade as the user's own tag.
+        self.inferred_genres: dict[str, str] = genre_infer.load(
+            config.INFERRED_GENRES_FILE) if config.INFER_GENRES else {}
+        self._inferred_at = 0    # vector count the overlay was last built for
 
     # ── startup ──────────────────────────────────────────────────────────────
     def start(self) -> None:
@@ -65,6 +72,7 @@ class Engine:
 
         try:
             count = self.library.refresh(self.features)
+            self._apply_inferred()
             print(f"✅ JLTamp connected: {count} tracks.")
         except Exception as e:                      # noqa: BLE001
             self.status = "jltamp-unreachable"
@@ -126,6 +134,11 @@ class Engine:
             todo = [by_key[k] for k in stale if k in by_key]
             self._stale_count = len(todo)
             if not todo:
+                # Embeddings are complete and stable — the only point at which
+                # rebuilding the genre overlay is worthwhile. Doing it after
+                # every batch (as this once did) reran a 100 s neighbour search
+                # dozens of times per fill and starved the HTTP server.
+                self._recompute_inferred()
                 time.sleep(300)
                 continue
 
@@ -153,9 +166,55 @@ class Engine:
             time.sleep(config.LIBRARY_REFRESH_SEC)
             try:
                 count = self.library.refresh(self.features)
+                self._apply_inferred()
                 print(f"🔄 Library refreshed: {count} tracks.")
             except Exception as e:                  # noqa: BLE001
                 print(f"⚠️  Library refresh failed: {e}")
+
+    # ── inferred genres ──────────────────────────────────────────────────────
+    def _apply_inferred(self) -> None:
+        """Overlay the inferred genre onto untagged tracks in the snapshot.
+
+        Only fills a placeholder — a real tag always wins. Runs after every
+        library refresh, since refresh builds fresh Track objects that do not
+        carry the overlay.
+        """
+        if not config.INFER_GENRES or not self.inferred_genres:
+            return
+        n = 0
+        for t in self.library.snapshot():
+            if genre_infer.is_placeholder(t.genre):
+                g = self.inferred_genres.get(t.rating_key)
+                if g:
+                    t.genre = g
+                    n += 1
+        if n:
+            print(f"🏷️  Applied inferred genre to {n} untagged tracks.")
+
+    def _recompute_inferred(self) -> None:
+        """Rebuild the inferred-genre overlay once the vectors it needs exist.
+
+        Only when the vector count has grown since the last build: the
+        neighbour search is ~100 s, and there is nothing to gain from repeating
+        it against an unchanged store.
+        """
+        if not config.INFER_GENRES or self.store is None:
+            return
+        if len(self.store) <= self._inferred_at:
+            return
+        try:
+            tracks = self.library.snapshot()
+            inferred = {k: g for k, (g, c)
+                        in genre_infer.infer_with_confidence(tracks, self.store).items()
+                        if c >= config.INFER_THRESHOLD}
+        except Exception as e:                       # noqa: BLE001
+            print(f"⚠️  Genre inference failed: {e}")
+            return
+        self.inferred_genres = inferred
+        self._inferred_at = len(self.store)
+        genre_infer.save(inferred, config.INFERRED_GENRES_FILE)
+        self._apply_inferred()
+        print(f"🏷️  Genre inference: {len(inferred)} untagged tracks labelled.")
 
     # ── per-user context ─────────────────────────────────────────────────────
     def user_context(self, token: str) -> dict | None:
@@ -374,6 +433,120 @@ class Engine:
             "message": message,
             "tracks": len(tracks),
         }
+
+    # ── weekly per-user playlists ────────────────────────────────────────────
+    def _taste_vector(self, client) -> tuple[np.ndarray, set[str]] | None:
+        """A user's taste centroid, plus the set of tracks they already know.
+
+        Built from their liked + most-played tracks. Returns None when there is
+        too little to go on: a "personal" playlist for someone who has barely
+        listened is a guess dressed up as a recommendation. Someone who has
+        played only a handful of tracks gets nothing rather than noise — better
+        no weekly playlist than a wrong one.
+        """
+        # Order matters: most-played first, then likes. The DNA mix is these
+        # tracks themselves — the user's actual favourites — so the order is
+        # the ranking. Deduplicated but kept in that order.
+        favourites: list[str] = []
+        seen: set[str] = set()
+        for key in client.most_played_ids(80) + list(client.liked_ids()):
+            if key not in seen:
+                seen.add(key)
+                favourites.append(key)
+        if len(seen) < config.MIN_TASTE_SEED:
+            return None
+        mat, present = self.store.matrix(favourites)
+        if len(present) < config.MIN_TASTE_SEED:
+            return None
+        centroid = mat.mean(axis=0)
+        return centroid, present    # present is in favourites order
+
+    def generate_weekly(self, only_user_id: int | None = None) -> list[dict]:
+        """Build 'DNA Mix' and 'Discovery' playlists for each active user.
+
+        Runs as the admin service, minting a per-user token so each playlist is
+        created in that user's own library from that user's own taste — never
+        shared, never in the wrong account.
+        """
+        if not self.ready:
+            return [{"status": "error", "message": "engine not ready"}]
+        tracks = self.library.snapshot()
+        by_key = {t.rating_key: t for t in tracks}
+        results = []
+
+        # The service client has been idle since boot; its keep-alive socket to
+        # JLTamp is likely dead. Reconnect once up front rather than stall on
+        # the first call.
+        self.client.refresh_connection()
+        for u in self.client.list_users():
+            uid = u.get("id")
+            if only_user_id is not None and uid != only_user_id:
+                continue
+            if not u.get("isActive", u.get("is_active", True)):
+                continue
+            # A month on the account before we claim to know their taste. New
+            # users have not listened enough to profile, however active — the
+            # listening-volume check below is the other half of the same rule.
+            created = u.get("createdAt", u.get("created_at", 0)) or 0
+            if created and (time.time() - created) < config.MIN_ACCOUNT_AGE_SEC:
+                results.append({"user": uid, "status": "skipped",
+                                "message": "account younger than a month"})
+                continue
+            token = self.client.session_for(uid)
+            if not token:
+                results.append({"user": uid, "status": "skipped",
+                                "message": "no session (endpoint deployed?)"})
+                continue
+
+            uclient = JLTampClient(token=token)
+            taste = self._taste_vector(uclient)
+            if taste is None:
+                results.append({"user": uid, "status": "skipped",
+                                "message": "too little listening history"})
+                continue
+            centroid, favourites = taste
+            cap = config.SCORING["MAX_TRACKS"]
+            known = set(favourites)
+
+            # DNA Mix = the user's own favourites, in play-count order. These
+            # ARE what they love; the earlier version searched near the taste
+            # centroid and filtered to known tracks, but favourites sit
+            # scattered around their own average, not on top of it, so it found
+            # almost none (1 of 50).
+            dna = []
+            for key in favourites:
+                t = by_key.get(key)
+                if t and not any(k in t.haystack for k in scoring.KIDS_WORDS):
+                    dna.append(t)
+                if len(dna) >= cap:
+                    break
+
+            # Discovery = nearest the taste centroid, but only tracks NOT yet
+            # played — the point is to surface things they would like but have
+            # not heard.
+            disco = []
+            for key, _sim in self.store.top_keys(
+                    centroid, [t.rating_key for t in tracks], cap * 6):
+                if key in known:
+                    continue
+                t = by_key.get(key)
+                if t and not any(k in t.haystack for k in scoring.KIDS_WORDS):
+                    disco.append(t)
+                if len(disco) >= cap:
+                    break
+
+            made = []
+            for name, picks in (("🧬 Jouw DNA Mix", dna),
+                                ("🔮 Ontdekking van de Week", disco)):
+                if len(picks) >= 10:
+                    try:
+                        uclient.create_playlist(name, picks)
+                        made.append(f"{name} ({len(picks)})")
+                    except Exception as e:        # noqa: BLE001
+                        made.append(f"{name} FAILED: {e}")
+            results.append({"user": uid, "email": u.get("email"),
+                            "status": "ok", "playlists": made})
+        return results
 
     # ── introspection ────────────────────────────────────────────────────────
     def health(self) -> dict:

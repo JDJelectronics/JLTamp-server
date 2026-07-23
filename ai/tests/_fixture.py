@@ -33,7 +33,11 @@ _FIELDS = ("rating_key", "title", "artist", "orig_artist", "album", "year",
 
 
 def _dump(tracks: list[Track]) -> None:
-    rows = [{f: getattr(t, f) for f in _FIELDS} for t in tracks]
+    # `features` (BPM/energy) is stored too, or the cached benchmark silently
+    # tests the context prompts with no audio data — which it did, hiding
+    # whether the whole audio analysis was even reaching the scorer.
+    rows = [{**{f: getattr(t, f) for f in _FIELDS}, "features": t.features}
+            for t in tracks]
     tmp = CACHE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps({"at": time.time(), "tracks": rows}))
     os.replace(tmp, CACHE)
@@ -48,27 +52,62 @@ def _load() -> list[Track] | None:
         return None
     if time.time() - blob.get("at", 0) > MAX_AGE_SEC:
         return None
-    return [Track(**row) for row in blob.get("tracks", [])]
+    tracks = []
+    for row in blob.get("tracks", []):
+        feats = row.pop("features", {})
+        t = Track(**row)
+        t.features = feats or {}
+        tracks.append(t)
+    return tracks
+
+
+def _apply_inferred(tracks: list[Track]) -> int:
+    """Overlay the engine's inferred genres, so the benchmark measures what the
+    live engine actually serves — not the raw tags the engine no longer uses
+    alone. Read from the same file the engine writes."""
+    from app import genre_infer
+    overlay = genre_infer.load(config.INFERRED_GENRES_FILE)
+    if not overlay:
+        return 0
+    n = 0
+    for t in tracks:
+        if genre_infer.is_placeholder(t.genre) and overlay.get(t.rating_key):
+            t.genre = overlay[t.rating_key]
+            n += 1
+    return n
 
 
 def load_library(fresh: bool = False, quiet: bool = False) -> list[Track]:
-    """Tracks with genres filled in, from cache when it is recent enough."""
+    """Tracks with genres filled in, from cache when it is recent enough.
+
+    The cache stores raw genres; the inferred overlay is applied on load, so a
+    changed overlay is picked up without rebuilding the whole cache."""
     if not fresh:
         cached = _load()
         if cached:
+            n = _apply_inferred(cached)
             if not quiet:
                 age = (time.time() - json.loads(CACHE.read_text())["at"]) / 60
-                print(f"{len(cached)} tracks (cache, {age:.0f} min oud)")
+                extra = f", +{n} afgeleid" if n else ""
+                print(f"{len(cached)} tracks (cache, {age:.0f} min oud{extra})")
             return cached
 
     client = JLTampClient()
     client.login()
+    feats = {}
+    if config.FEATURES_FILE.exists():
+        try:
+            feats = json.loads(config.FEATURES_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            feats = {}
     lib = Library(client)
-    lib.refresh()
+    lib.refresh(feats)
     tracks = lib.snapshot()
-    _dump(tracks)
+    _dump(tracks)                      # cache the RAW genres
+    n = _apply_inferred(tracks)
     if not quiet:
-        print(f"{len(tracks)} tracks (vers opgehaald)")
+        extra = f", +{n} afgeleid" if n else ""
+        print(f"{len(tracks)} tracks (vers opgehaald{extra})")
     return tracks
 
 

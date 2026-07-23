@@ -13,7 +13,10 @@ case "${1:-status}" in
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
       echo "already running (pid $(cat "$PIDFILE"))"; exit 0
     fi
-    setsid nohup python3 -m app.main > logs/engine.log 2>&1 < /dev/null &
+    # -u: unbuffered. To a file (not a tty) Python block-buffers stdout, so the
+    # log stayed empty for minutes while the engine ran fine — every diagnosis
+    # read a blank file. Line-buffered output makes the log trustworthy.
+    setsid nohup python3 -u -m app.main > logs/engine.log 2>&1 < /dev/null &
     echo $! > "$PIDFILE"
     sleep 2
     kill -0 "$(cat "$PIDFILE")" 2>/dev/null && echo "started (pid $(cat "$PIDFILE"))" \

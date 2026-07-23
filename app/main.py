@@ -22,7 +22,7 @@ from . import config, backup
 from .db import init_db
 from .deps import require_admin, seed_admin
 from .scanner import scan_all, scan_state, request_stop
-from .routers import auth, media, stream, artwork, playlists, libraries, admin_users, likes, uploads, history, stats
+from .routers import auth, media, stream, artwork, playlists, libraries, admin_users, likes, uploads, history, stats, mix, session
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -73,7 +73,8 @@ app.add_middleware(
 
 for r in (auth.router, media.router, stream.router, artwork.router,
           playlists.router, libraries.router, admin_users.router, likes.router,
-          uploads.router, history.router, stats.router):
+          uploads.router, history.router, stats.router, mix.router,
+          session.router):
     app.include_router(r)
 
 
@@ -183,11 +184,17 @@ def api_root():
 # Privacy policy — a real page at /privacy (declared before the SPA catch-all
 # below so it isn't swallowed by the app shell). Used for the Play Store listing.
 _PRIVACY = Path(__file__).parent / "static" / "privacy.html"
+_DELETE_ACCOUNT = Path(__file__).parent / "static" / "account-deletion.html"
 
 
 @app.get("/privacy")
 def _privacy():
     return FileResponse(_PRIVACY, media_type="text/html")
+
+
+@app.get("/delete-account")
+def _delete_account():
+    return FileResponse(_DELETE_ACCOUNT, media_type="text/html")
 
 
 WEB_DIR = Path(os.environ.get("WEB_DIR", "/web"))

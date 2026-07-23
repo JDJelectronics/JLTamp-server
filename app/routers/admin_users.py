@@ -14,7 +14,7 @@ from ..models import (User, UserLibraryAccess, Library, Session as AuthSession,
                       PlayEvent)
 from ..security import new_invite, norm_email
 from .. import config, mailer
-from ..deps import require_admin
+from ..deps import require_admin, create_session
 
 router = APIRouter()
 
@@ -89,6 +89,29 @@ def list_users(_: User = Depends(require_admin)):
     try:
         return {"users": [_user_dict(db, u) for u in
                           db.execute(select(User).order_by(User.id)).scalars()]}
+    finally:
+        db.close()
+
+
+@router.post("/admin/users/{user_id}/session")
+def mint_user_session(user_id: int, admin: User = Depends(require_admin)):
+    """Issue a session token for another user. Admin-only.
+
+    The AI engine runs background jobs — weekly discovery playlists — that must
+    create playlists *as* each user, but a background job holds no user's login
+    token. This lets the admin engine obtain one. It is deliberately narrow:
+    admin auth is required, the token is labelled so it is distinguishable in
+    the sessions table, and it grants exactly what any of that user's own
+    tokens would. It does NOT widen what a non-admin can do.
+    """
+    db = SessionLocal()
+    try:
+        user = db.get(User, user_id)
+        if not user or not user.is_active:
+            raise HTTPException(404, "user not found or inactive")
+        token = create_session(db, user, label="ai-service")
+        return {"token": token, "user_id": user.id,
+                "email": user.email, "display_name": user.display_name}
     finally:
         db.close()
 
@@ -238,7 +261,7 @@ def delete_user(user_id: int, admin: User = Depends(require_admin)):
 
 # ── import liked/rated tracks from an existing Plex server (READ-ONLY) ────────
 class PlexImportBody(BaseModel):
-    plex_url: str = "http://localhost:32400"
+    plex_url: str = "http://192.168.1.10:32400"
     plex_token: str
     min_rating: float = 1.0
 

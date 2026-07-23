@@ -296,7 +296,7 @@ def send_new_music(to_email: str, server_name: str, album_count: int,
     msg["Subject"] = f"{track_count} nieuwe nummers op {server_name}"
     msg["From"] = SMTP_FROM
     msg["To"] = to_email
-    msg["Reply-To"] = SMTP_FROM or "no-reply@localhost"
+    msg["Reply-To"] = "no-reply@your-domain.example"
     msg.set_content("\n".join(lines))
 
     rows = "".join(

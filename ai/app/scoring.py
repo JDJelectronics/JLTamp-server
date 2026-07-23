@@ -44,6 +44,9 @@ CONTEXT_MAPPER: dict[str, list[str]] = {
     "akoestisch": ["acoustic", "unplugged", "guitar", "piano", "live", "puur"],
     "instrumentaal": ["no vocals", "instrumental", "orchestral", "beat", "karaoke", "geen zang"],
     "hard": ["loud", "heavy", "bass boost", "distorted", "extreme", "beuken", "hardstyle"],
+    "rustig": ["calm", "mellow", "soft", "gentle", "quiet", "kalm", "ontspannen", "sereen"],
+    "meditatie": ["meditation", "meditatie", "zen", "mindful", "ambient", "healing", "yoga"],
+    "workout": ["workout", "gym", "power", "energy", "training", "cardio", "beast mode"],
 }
 
 # What the measured audio should look like for a context: (bpm range, min energy).
@@ -55,8 +58,11 @@ AUDIO_TARGETS: dict[str, tuple[tuple[int, int] | None, float | None]] = {
     "hard": ((130, 200), 0.12),
     "schoonmaak": ((100, 140), 0.08),
     "focus": ((60, 105), None),
-    "relax": ((55, 100), None),
-    "slapen": ((40, 90), None),
+    "relax": ((55, 95), None),
+    "rustig": ((50, 95), None),
+    "meditatie": ((40, 85), None),
+    "slapen": ((40, 85), None),
+    "workout": ((120, 180), 0.10),
     "romantisch": ((50, 100), None),
 }
 
@@ -254,9 +260,9 @@ def named_genres(prompt: str, tracks: list[Track]) -> set[str]:
     every genre containing it, and only for tags of a useful length.
     """
     # Exact match only. Anything looser reintroduces the same failure by
-    # another route: allowing a two-word prompt let "nederlandse pop" boost
-    # thousands of tracks tagged `pop` — precisely what that prompt is trying to
-    # avoid — and it collapsed the results. "hardcore" is a request for a tag;
+    # another route: allowing a two-word prompt let "nederlandse pop" boost all
+    # 11,158 tracks tagged `pop` — precisely what that prompt is trying to
+    # avoid — and it fell from 76% to 62%. "hardcore" is a request for a tag;
     # "nederlandse pop" is a description that happens to contain one.
     prompt_l = prompt.lower().strip()
     return {t.genre.strip().lower() for t in tracks if t.genre.strip()} & {prompt_l}
@@ -324,8 +330,8 @@ def score_tracks(prompt: str, tracks: list[Track], similarity: dict[str, float],
             if tag and tag in asked_genres:
                 score += SCORING["BOOST_NAMED_GENRE"]
 
-        # The performer, not the album's grouping artist. A large share of a
-        # library sits on compilations where that
+        # The performer, not the album's grouping artist. Two thirds of this
+        # library (46,773 of 69,467 tracks) sits on compilations where that
         # field reads "Various Artists"; treating it as an artist name makes
         # every one of them the same artist.
         artist = t.real_artist
@@ -359,9 +365,9 @@ def select(scored: list[tuple[Track, float]], limit: int | None = None,
     Variety is enforced here rather than in the score, because the question is
     "how often does this artist already appear *in this playlist*" — a property
     of the selection, not of the track. Scoring it per track meant penalising
-    an artist for how much of the *library* they occupy: with tens of thousands of tracks
-    credited to "Various Artists", the best match in the library came out far down the list.
-    
+    an artist for how much of the *library* they occupy: with 46,773 tracks
+    credited to "Various Artists", the best match in the library came out at
+    position 3,711.
 
     `relaxed` lowers the floor for prompts that carry their own strong filters
     (a decade, a context, a kids request) — there the filter already did the

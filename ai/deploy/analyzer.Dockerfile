@@ -1,6 +1,6 @@
 # Audio analysis, containerised.
 #
-# librosa leans on numba, which JIT-compiles through llvmlite. On your server's
+# librosa leans on numba, which JIT-compiles through llvmlite. On your-server's
 # Python 3.13 that combination segfaults inside beat_track — reproducibly, and
 # pinning numpy did not help. Python 3.11 is what numba is actually tested
 # against, so the analysis runs in here rather than on the host interpreter.
@@ -13,8 +13,8 @@
 #
 # Run (music read-only, cache writable):
 #   docker run --rm \
-#     -v /path/to/your/music/mp3:/music/mp3:ro \
-#     -v /path/to/your/music/flac:/music/flac:ro \
+#     -v /path/to/your/music:/music/mp3:ro \
+#     -v /path/to/your/flac:/music/flac:ro \
 #     -v $HOME/jltamp-ai:/out \
 #     -e MUSIC_PATH_MAP=/music/mp3:/music/mp3,/music/flac:/music/flac \
 #     -e AI_FEATURES_FILE=/out/track_features.json \

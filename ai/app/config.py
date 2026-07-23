@@ -90,12 +90,28 @@ REQUIRE_USER_TOKEN = _env("AI_REQUIRE_USER_TOKEN", "0").lower() in (
     "1", "true", "yes", "on")
 
 DATA_DIR = Path(_env("AI_DATA_DIR", str(BASE_DIR / "data")))
+
+# Infer a genre for tracks that carry none, from their embedding neighbours, so
+# the ~half of the library with a blank/placeholder tag still matches genre
+# prompts. A guessed genre is written to a separate overlay, never over a real
+# tag. Threshold measured: lower labels more and scores better here, 0.28 keeps
+# a floor of neighbour agreement so it is not a blind guess.
+INFER_GENRES = _env("AI_INFER_GENRES", "1").lower() in ("1", "true", "yes", "on")
+INFER_THRESHOLD = _env_float("AI_INFER_THRESHOLD", 0.28)
+INFERRED_GENRES_FILE = Path(_env("AI_INFERRED_GENRES_FILE",
+                                 str(DATA_DIR / "inferred_genres.json")))
 # Audio features (BPM/energy/brightness) produced by scripts/analyze_audio.py.
 FEATURES_FILE = Path(_env("AI_FEATURES_FILE", str(DATA_DIR / "track_features.json")))
 
 # How often the background worker re-syncs the track list from JLTamp.
 LIBRARY_REFRESH_SEC = _env_int("AI_LIBRARY_REFRESH_SEC", 3600)
 JOB_TIMEOUT_SEC = _env_int("AI_JOB_TIMEOUT_SEC", 120)
+
+# Weekly per-user playlists only run once we can actually know a taste. A user
+# who has barely listened gets no "personal" playlist rather than a random one.
+# Both must be met: enough of an account history, and enough listening in it.
+MIN_ACCOUNT_AGE_SEC = _env_int("AI_MIN_ACCOUNT_AGE_DAYS", 0) * 86400
+MIN_TASTE_SEED = _env_int("AI_MIN_TASTE_SEED", 25)
 MAX_JOBS = _env_int("AI_MAX_JOBS", 20)
 
 # ── Scoring weights ──────────────────────────────────────────────────────────
@@ -117,7 +133,7 @@ SCORING = {
     # Naming a genre the library actually has is a strong, explicit
     # statement — stronger than any similarity the text can express.
     "BOOST_NAMED_GENRE": 0.25,
-    "BOOST_AUDIO_FEATURE": 0.12,
+    "BOOST_AUDIO_FEATURE": 0.14,
     "BOOST_LIKED": 0.05,
     "PENALTY_ARTIST_REPEAT": 0.03,
     "PENALTY_SKIPPED": 0.04,

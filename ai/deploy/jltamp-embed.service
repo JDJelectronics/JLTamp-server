@@ -4,9 +4,9 @@ After=network.target
 
 [Service]
 Type=simple
-User=USER
-Group=USER
-WorkingDirectory=/home/USER/jltamp-ai
+User=jlt
+Group=jlt
+WorkingDirectory=/home/USER/jltamp/ai
 
 # Bound to 127.0.0.1: only the AI service on this host needs it, and an
 # embedding endpoint open to the network is free GPU time for anyone who
