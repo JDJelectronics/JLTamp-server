@@ -28,8 +28,8 @@ JLTamp does not provide, host, or distribute any music. It only plays media from
 You need [Docker](https://docs.docker.com/get-docker/) with Compose.
 
 ```bash
-git clone https://github.com/<your-org>/jltamp-server.git
-cd jltamp-server
+git clone https://github.com/JDJelectronics/JLTamp-server.git
+cd JLTamp-server
 ```
 
 1. Open `docker-compose.yml`, **mount your own music folder**, and set a
@@ -58,15 +58,22 @@ cd jltamp-server
    docker compose up -d --build
    ```
 
-3. Open **http://localhost:32400** in a browser (or point the JLTamp app at it),
-   and log in with the username/password you set.
+3. Open **http://localhost:32400** in a browser. The **JLTamp web app is bundled
+   with the server** and loads straight away — no separate frontend to install,
+   no address to type. It talks to whatever origin served it, so `localhost`
+   (and your LAN IP, or your own domain behind a reverse proxy) just works. Log
+   in with the username/password you set.
 
 4. In the web UI, **add a library** (a folder under your music mount) and run a
-   **scan**. Your music appears in the app.
+   **scan**. Your music then appears in the web app and in the mobile app.
 
 Your music is mounted **read‑only** — the server never modifies your files. All
 writable data (database, cached artwork, users, playlists, likes) lives in the
 `jltamp-data` volume, so it survives rebuilds.
+
+> **No hosted account, no domain required.** This is *your* server: you sign in
+> against it directly (email + password). There is no external sign‑in and
+> nothing phones home.
 
 ---
 
