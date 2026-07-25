@@ -334,6 +334,77 @@ def register(body: RegisterBody, request: Request):
         db.close()
 
 
+# ── First-run setup ────────────────────────────────────────────────────────────
+# On a fresh install the owner/admin row exists (seeded from JLTAMP_ADMIN_EMAIL)
+# but has NO usable password — the built-in "changeme" default is refused by
+# seed_admin(). Instead of baking a password into docker-compose, the very first
+# visitor sets the admin credentials here, in the browser (like Jellyfin/NAS
+# first-run wizards). SELF-CLOSING: it only works while no admin has a password
+# yet, so it can't take over an already-configured server. Setting a real
+# JLTAMP_PASSWORD still works as a fallback (seed_admin applies it → setup done).
+
+class SetupBody(BaseModel):
+    password: str
+    email: str | None = None
+    display_name: str | None = None
+    lang: str | None = None
+
+
+def _setup_required(db) -> bool:
+    """True while no admin account has a usable password yet (first-run)."""
+    return db.query(User).filter(
+        User.is_admin == True, User.password_hash.isnot(None)  # noqa: E712
+    ).first() is None
+
+
+@router.get("/auth/setup-state")
+def setup_state():
+    db = SessionLocal()
+    try:
+        return {"setupRequired": _setup_required(db)}
+    finally:
+        db.close()
+
+
+@router.post("/auth/setup")
+def setup(body: SetupBody, request: Request):
+    if not body.password or len(body.password) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters")
+    db = SessionLocal()
+    try:
+        if not _setup_required(db):
+            raise HTTPException(409, "Server is already set up")   # takeover guard
+        new_email = norm_email(body.email) if body.email else None
+        owner = (db.query(User).filter(User.email == config.ADMIN_EMAIL).first()
+                 or db.query(User).filter(User.is_admin == True)  # noqa: E712
+                       .order_by(User.id).first())
+        if owner is None:
+            owner = User(email=new_email or config.ADMIN_EMAIL,
+                         display_name=(body.display_name or config.ADMIN_NAME).strip(),
+                         is_admin=True, is_active=True, created_at=int(time.time()),
+                         lang=(body.lang or None))
+            db.add(owner)
+        else:
+            if new_email and new_email != owner.email:
+                if db.query(User).filter(User.email == new_email,
+                                         User.id != owner.id).first():
+                    raise HTTPException(409, "Email already in use")
+                owner.email = new_email
+            if body.display_name:
+                owner.display_name = body.display_name.strip()
+            if body.lang:
+                owner.lang = body.lang
+        owner.password_hash = hash_password(body.password)
+        owner.is_admin = True
+        owner.is_active = True
+        db.commit()
+        token = create_session(db, owner, label="web-setup")
+        return {"token": token, "user": _user_dict(owner),
+                "server": _server_descriptor(request, token)}
+    finally:
+        db.close()
+
+
 @router.get("/auth/me")
 def me(user: User = Depends(require_user)):
     return _user_dict(user)

@@ -16,8 +16,10 @@ JLTamp does not provide, host, or distribute any music. It only plays media from
 - 🎵 Stream your own library (MP3, FLAC, ALAC, WAV, AAC, OGG, Opus, …)
 - 👥 Multi‑user, invite‑based — everyone gets their own account
 - ❤️ Per‑user liked songs, playlists and play history
-- 🗂️ Plex‑style libraries + on‑demand scanning
+- 🗂️ Plex‑style libraries with a **folder browser** + on‑demand scanning
 - 🖼️ Automatic album art & artist images (fetched from public music databases)
+- 📥 Import **Spotify / YouTube** playlists (and Plex playlists/likes) into your library
+- 🚀 **Set up in the browser** — first‑run wizard creates your admin account
 - 📱 Works with the **JLTamp app** (Android + web)
 - 🔒 Passwords hashed, per‑user tokens, music mounted **read‑only**
 
@@ -40,9 +42,9 @@ cd JLTamp-server
 
    ```yaml
    environment:
-     JLTAMP_USERNAME: "admin"
-     JLTAMP_PASSWORD: "change-me-please"
      SERVER_NAME: "My Music"
+     # No password here — you create your admin account in the browser on first
+     # run (step 3). Optionally set JLTAMP_PASSWORD for a fixed backup admin.
    volumes:
      - /path/to/your/music:/music:ro     # ← EDIT: your own music folder (read-only)
      - jltamp-data:/data                 # server DB + artwork cache
@@ -61,11 +63,17 @@ cd JLTamp-server
 3. Open **http://localhost:32400** in a browser. The **JLTamp web app is bundled
    with the server** and loads straight away — no separate frontend to install,
    no address to type. It talks to whatever origin served it, so `localhost`
-   (and your LAN IP, or your own domain behind a reverse proxy) just works. Log
-   in with the username/password you set.
+   (and your LAN IP, or your own domain behind a reverse proxy) just works.
+   **On first run it shows a quick setup wizard** — create your admin account
+   (email + password) right there and you're in. (No wizard if you set a
+   `JLTAMP_PASSWORD` — then just log in with that.)
 
-4. In the web UI, **add a library** (a folder under your music mount) and run a
-   **scan**. Your music then appears in the web app and in the mobile app.
+4. In the web UI go to **Settings → Libraries** and **add a library**: a
+   Plex‑style **folder browser** lets you click through the folders under your
+   music mount (▸ to go into a folder, tap to select it), pick one or more, and
+   run a **scan**. Your music then appears in the web app and the mobile app.
+   From the same screen you can also **import Spotify / YouTube playlists** and,
+   if you run Plex, import your Plex playlists and likes.
 
 Your music is mounted **read‑only** — the server never modifies your files. All
 writable data (database, cached artwork, users, playlists, likes) lives in the
@@ -74,6 +82,20 @@ writable data (database, cached artwork, users, playlists, likes) lives in the
 > **No hosted account, no domain required.** This is *your* server: you sign in
 > against it directly (email + password). There is no external sign‑in and
 > nothing phones home.
+
+### Using a NAS
+
+Mount your NAS share on the **host** (SMB/NFS/CIFS) and pass the mount point as
+the `:/music:ro` volume — the server browses it like any other folder. The
+folder browser is deliberately sandboxed to the mounted music path, so it can
+never expose the rest of your filesystem.
+
+There's a **“Discover NAS on my network”** button under *Settings → Libraries*
+that lists NAS/file‑share devices found via mDNS — hints to help you find the
+address to mount. It can’t mount shares for you (a read‑only container has no
+business doing that), and on a default Docker **bridge** network mDNS is usually
+blocked, so run the container with `network_mode: host` if you want discovery to
+work. Mounting on the host is the reliable path either way.
 
 ---
 
