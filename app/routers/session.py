@@ -24,6 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisco
 
 from ..deps import _user_for_token, require_user
 from ..models import User
+from ..serializers import user_thumb_ref
 
 router = APIRouter(prefix="/session", tags=["session"])
 
@@ -154,7 +155,10 @@ async def session_ws(websocket: WebSocket, code: str):
         or getattr(user, "username", None)
         or f"User {user.id}"
     )
-    thumb = getattr(user, "thumb_path", None)
+    # A URL, not the raw thumb_path. This handed clients a SERVER FILESYSTEM
+    # path, which no client can load — so every participant showed a broken
+    # avatar.
+    thumb = user_thumb_ref(user)
     is_host = user.id == s.host_user_id
     s.participants[user.id] = Participant(
         user_id=user.id, name=name, thumb=thumb, ws=websocket, is_host=is_host
@@ -220,11 +224,15 @@ async def session_ws(websocket: WebSocket, code: str):
                 s.track = msg.get("track")
                 s.queue = msg.get("queue", s.queue)
                 s.position_ms = int(msg.get("positionMs", 0))
-                s.is_playing = True
+                # Honour the host's real play state instead of assuming True: a
+                # host promoted mid-session republishes its current track while it
+                # may be PAUSED, which otherwise started every guest against a
+                # silent host. Defaults to True for older clients.
+                s.is_playing = bool(msg.get("isPlaying", True))
                 s.anchor_ts = _now_ms() + 700  # scheduled start ~700ms ahead
                 await _broadcast(s, {
                     "t": "track", "track": s.track, "queue": s.queue,
-                    "positionMs": s.position_ms, "startAtServerTs": s.anchor_ts,
+                    "positionMs": s.position_ms, "isPlaying": s.is_playing, "startAtServerTs": s.anchor_ts,
                     "serverTs": _now_ms(),
                 }, exclude=user.id)
             elif t == "play":

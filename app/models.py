@@ -251,3 +251,26 @@ Index("ix_pli_playlist_pos", PlaylistItem.playlist_id, PlaylistItem.position)
 Index("ix_artist_lib_sort", Artist.library_id, Artist.sort_name)
 Index("ix_album_lib_sort", Album.library_id, Album.sort_title)
 Index("ix_track_lib", Track.library_id)
+
+
+class ScanDir(Base):
+    """Per-directory mtime, so a quick scan can skip folders that cannot contain
+    anything new.
+
+    A directory's mtime changes whenever an entry is added, removed or renamed
+    inside it — which is exactly what "new music arrived" looks like. It does
+    NOT change when an existing file's contents are edited in place, so a quick
+    scan will not notice a retag; that is what a full scan is for.
+
+    Why this exists: deciding "nothing changed" used to cost one stat() per FILE.
+    On the real library (78k files over NFS) that alone took ~290s on every scan.
+    Checking ~2k directory mtimes instead takes ~1.5s.
+
+    Lives in the writable data dir with the rest of the DB — never on the
+    read-only music mount.
+    """
+    __tablename__ = "scan_dirs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    library_id: Mapped[int] = mapped_column(Integer, index=True)
+    path: Mapped[str] = mapped_column(String, index=True)
+    mtime: Mapped[float] = mapped_column(Float, default=0.0)

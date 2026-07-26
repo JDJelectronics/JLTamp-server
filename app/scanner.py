@@ -37,7 +37,7 @@ except Exception:
 
 from . import config
 from .db import SessionLocal
-from .models import Artist, Album, Track, PlaylistItem, Library, LibraryFolder
+from .models import Artist, Album, Track, PlaylistItem, Library, LibraryFolder, ScanDir
 
 log = logging.getLogger("scanner")
 
@@ -326,10 +326,15 @@ def _resolve_album_art(album_id: int, sample_track: Path) -> str | None:
 IGNORE_FILES = (".plexignore", ".jltampignore")
 
 
-def _load_ignore(dir_path: Path) -> list[str] | None:
+def _load_ignore(dir_path: Path, filenames: list[str] | None = None) -> list[str] | None:
     """Patterns for a directory, or None if it has no ignore file. `['*']` means
     'ignore the whole folder'."""
     for name in IGNORE_FILES:
+        # Use the listing os.walk already produced: the old is_file() probe was a
+        # separate stat() per candidate name per directory — thousands of extra
+        # round trips on a network mount just to learn the files aren't there.
+        if filenames is not None and name not in filenames:
+            continue
         f = dir_path / name
         if f.is_file():
             try:
@@ -341,13 +346,16 @@ def _load_ignore(dir_path: Path) -> list[str] | None:
     return None
 
 
-def _iter_audio(root: Path):
+def _iter_audio_dirs(root: Path):
+    """Yield `(directory, [audio files in it])`, one entry per directory, so the
+    caller can make a per-DIRECTORY decision instead of stat'ing every file just
+    to discover nothing changed."""
     if not root.exists():
         log.warning("library folder %s does not exist", root)
         return
     for dirpath, dirnames, filenames in os.walk(root):
         d = Path(dirpath)
-        pats = _load_ignore(d)
+        pats = _load_ignore(d, filenames)
         if pats == ["*"]:
             log.info("ignoring folder (ignore file): %s", d)
             dirnames[:] = []  # prune everything below
@@ -355,12 +363,14 @@ def _iter_audio(root: Path):
         if pats:
             # Skip matching subfolders and matching files in this directory.
             dirnames[:] = [dn for dn in dirnames if not any(fnmatch(dn, p) for p in pats)]
+        audio = []
         for fn in filenames:
             if pats and any(fnmatch(fn, p) for p in pats):
                 continue
             p = d / fn
             if p.suffix.lower() in config.AUDIO_EXTS:
-                yield p
+                audio.append(p)
+        yield d, audio
 
 
 # ── main scan (per library) ──────────────────────────────────────────────────
@@ -428,88 +438,146 @@ def scan_library(library_id: int, full: bool = False, keep_new: bool = False) ->
             album_cache[key] = al
             return al
 
+        # ── Quick-scan bookkeeping: per-directory mtimes ──────────────────
+        # Deciding "nothing changed" used to cost a stat() per FILE. On a large
+        # library on a network mount that is tens of thousands of stats —
+        # minutes on EVERY scan, even when nothing was added. A directory's
+        # mtime already tells us whether an entry was added, removed or renamed
+        # inside it, and checking a few thousand of those takes seconds.
+        #
+        # Caveat, deliberately accepted: a directory's mtime does NOT change when
+        # an existing file is edited in place, so a quick scan will not pick up a
+        # retag. `full=True` still stats every file and is the answer for that.
+        dir_mtimes: dict[str, float] = {
+            r.path: r.mtime for r in db.execute(
+                select(ScanDir).where(ScanDir.library_id == library_id)).scalars()
+        }
+        existing_by_dir: dict[str, list[str]] = {}
+        for _p in existing:
+            existing_by_dir.setdefault(os.path.dirname(_p), []).append(_p)
+        fresh_dir_mtimes: dict[str, float] = {}
+        skipped_dirs = 0
+
         count = 0
         cancelled = False
         for folder in folders:
             if cancelled:
                 break
-            for path in _iter_audio(Path(folder)):
-                # Stop cleanly on request — keep everything committed so far, but
-                # DON'T prune (missing files below would look "vanished").
-                if _scan_cancel["flag"]:
-                    cancelled = True
-                    log.info("[%s] scan cancelled after %d tracks", lib.name, count)
+            for _dir, _audio in _iter_audio_dirs(Path(folder)):
+                if cancelled:
                     break
-                sp = str(path)
-                seen_paths.add(sp)
+                dpath = str(_dir)
                 try:
-                    st = path.stat()
+                    dmtime = _dir.stat().st_mtime
                 except OSError:
+                    dmtime = 0.0
+                fresh_dir_mtimes[dpath] = dmtime
+                prev_dmtime = dir_mtimes.get(dpath)
+                if (
+                    not full
+                    and prev_dmtime is not None
+                    and abs(prev_dmtime - dmtime) < 1.0
+                ):
+                    # Unchanged folder: nothing added/removed/renamed here. Keep
+                    # its tracks alive for the prune step and move on WITHOUT
+                    # touching a single file.
+                    seen_paths.update(existing_by_dir.get(dpath, ()))
+                    skipped_dirs += 1
                     continue
-                prev = existing.get(sp)
-                if prev and not full and abs(prev.mtime - st.st_mtime) < 1.0:
-                    continue
 
-                tags, info = _read(path)
-                if info is None:
-                    continue
+                for path in _audio:
+                    # Stop cleanly on request — keep everything committed so far, but
+                    # DON'T prune (missing files below would look "vanished").
+                    if _scan_cancel["flag"]:
+                        cancelled = True
+                        log.info("[%s] scan cancelled after %d tracks", lib.name, count)
+                        break
+                    sp = str(path)
+                    seen_paths.add(sp)
+                    try:
+                        st = path.stat()
+                    except OSError:
+                        continue
+                    prev = existing.get(sp)
+                    if prev and not full and abs(prev.mtime - st.st_mtime) < 1.0:
+                        continue
 
-                title = _first(tags, "title") or path.stem
-                track_artist = _first(tags, "artist") or "Unknown Artist"
-                album_artist = _first(tags, "albumartist") or track_artist
-                album_title = _first(tags, "album") or "Unknown Album"
-                genre = _first(tags, "genre")
-                year = _year(_first(tags, "date", "originaldate", "year"))
-                track_no = _int(_first(tags, "tracknumber"))
-                disc_no = _int(_first(tags, "discnumber"))
+                    tags, info = _read(path)
+                    if info is None:
+                        continue
 
-                container, codec, bits = _container_codec(path, info)
-                # Loudness normalisation: prefer the track ReplayGain tag, fall
-                # back to album gain. NULL when neither is present (phase 2 will
-                # measure those on demand). Cheap — no audio decode.
-                gain_db = _parse_gain(_first(tags, "replaygain_track_gain",
-                                             "replaygain_album_gain"))
-                duration_ms = int((getattr(info, "length", 0) or 0) * 1000)
-                bitrate = int((getattr(info, "bitrate", 0) or 0) / 1000)
-                channels = getattr(info, "channels", 2) or 2
-                samplerate = getattr(info, "sample_rate", 44100) or 44100
+                    title = _first(tags, "title") or path.stem
+                    track_artist = _first(tags, "artist") or "Unknown Artist"
+                    album_artist = _first(tags, "albumartist") or track_artist
+                    album_title = _first(tags, "album") or "Unknown Album"
+                    genre = _first(tags, "genre")
+                    year = _year(_first(tags, "date", "originaldate", "year"))
+                    track_no = _int(_first(tags, "tracknumber"))
+                    disc_no = _int(_first(tags, "discnumber"))
 
-                artist = get_artist(album_artist)
-                album = get_album(album_title, artist, year, genre, path)
-                # What we're reading right now — shown live in the admin UI.
-                _scan_state["current"] = f"{album_artist} — {album_title}"
-                orig_artist = track_artist if track_artist and track_artist != album_artist else ""
+                    container, codec, bits = _container_codec(path, info)
+                    # Loudness normalisation: prefer the track ReplayGain tag, fall
+                    # back to album gain. NULL when neither is present (phase 2 will
+                    # measure those on demand). Cheap — no audio decode.
+                    gain_db = _parse_gain(_first(tags, "replaygain_track_gain",
+                                                 "replaygain_album_gain"))
+                    duration_ms = int((getattr(info, "length", 0) or 0) * 1000)
+                    bitrate = int((getattr(info, "bitrate", 0) or 0) / 1000)
+                    channels = getattr(info, "channels", 2) or 2
+                    samplerate = getattr(info, "sample_rate", 44100) or 44100
 
-                fields = dict(
-                    library_id=library_id,
-                    title=title, sort_title=_sort_key(title),
-                    album_id=album.id, album_title=album.title,
-                    artist_id=artist.id, artist_name=artist.name, album_artist=album_artist,
-                    orig_artist=orig_artist,
-                    track_no=track_no, disc_no=disc_no, duration_ms=duration_ms, genre=genre, year=year,
-                    path=sp, ext=path.suffix.lower(), container=container, codec=codec,
-                    bitrate=bitrate, channels=channels, samplerate=samplerate, bits=bits,
-                    size=st.st_size, mtime=st.st_mtime, art_path=album.art_path,
-                    added_at=int(st.st_ctime), gain_db=gain_db,
-                )
-                if prev:
-                    for k, v in fields.items():
-                        setattr(prev, k, v)
+                    artist = get_artist(album_artist)
+                    album = get_album(album_title, artist, year, genre, path)
+                    # What we're reading right now — shown live in the admin UI.
+                    _scan_state["current"] = f"{album_artist} — {album_title}"
+                    orig_artist = track_artist if track_artist and track_artist != album_artist else ""
+
+                    fields = dict(
+                        library_id=library_id,
+                        title=title, sort_title=_sort_key(title),
+                        album_id=album.id, album_title=album.title,
+                        artist_id=artist.id, artist_name=artist.name, album_artist=album_artist,
+                        orig_artist=orig_artist,
+                        track_no=track_no, disc_no=disc_no, duration_ms=duration_ms, genre=genre, year=year,
+                        path=sp, ext=path.suffix.lower(), container=container, codec=codec,
+                        bitrate=bitrate, channels=channels, samplerate=samplerate, bits=bits,
+                        size=st.st_size, mtime=st.st_mtime, art_path=album.art_path,
+                        added_at=int(st.st_ctime), gain_db=gain_db,
+                    )
+                    if prev:
+                        for k, v in fields.items():
+                            setattr(prev, k, v)
+                    else:
+                        db.add(Track(**fields))
+                        _note_new_track(library_id, artist.name, title, album.title)
+                    count += 1
+                    # Commit FREQUENTLY: get_artist/get_album flush() opens a write
+                    # transaction (holding SQLite's single write lock) that stays
+                    # open until commit. With slow NFS tag reads in between, a large
+                    # batch would hold the lock for minutes and make concurrent
+                    # writes (login, likes) fail with "database is locked". Small
+                    # batches keep the lock window to a few seconds.
+                    if count % 25 == 0:
+                        db.commit()
+                        _scan_state["tracks"] = count
+                    if count % 500 == 0:
+                        log.info("[%s] scanned %d tracks…", lib.name, count)
+
+        # Remember the directory mtimes so the NEXT scan can skip untouched
+        # folders. Only after a clean run: a cancelled scan never visited the
+        # rest of the tree.
+        if not cancelled:
+            for _dp, _dm in fresh_dir_mtimes.items():
+                row = db.execute(select(ScanDir).where(
+                    ScanDir.library_id == library_id, ScanDir.path == _dp)).scalars().first()
+                if row:
+                    row.mtime = _dm
                 else:
-                    db.add(Track(**fields))
-                    _note_new_track(library_id, artist.name, title, album.title)
-                count += 1
-                # Commit FREQUENTLY: get_artist/get_album flush() opens a write
-                # transaction (holding SQLite's single write lock) that stays
-                # open until commit. With slow NFS tag reads in between, a large
-                # batch would hold the lock for minutes and make concurrent
-                # writes (login, likes) fail with "database is locked". Small
-                # batches keep the lock window to a few seconds.
-                if count % 25 == 0:
-                    db.commit()
-                    _scan_state["tracks"] = count
-                if count % 500 == 0:
-                    log.info("[%s] scanned %d tracks…", lib.name, count)
+                    db.add(ScanDir(library_id=library_id, path=_dp, mtime=_dm))
+            for _dp in set(dir_mtimes) - set(fresh_dir_mtimes):
+                db.execute(delete(ScanDir).where(
+                    ScanDir.library_id == library_id, ScanDir.path == _dp))
+            log.info("[%s] quick-scan skipped %d unchanged folders", lib.name, skipped_dirs)
 
         # Prune tracks whose files vanished — but NOT after a cancel: the scan
         # never reached the rest of the library, so those files aren't gone.

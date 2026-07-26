@@ -21,6 +21,7 @@ from ..security import verify_password, hash_password, norm_email
 from ..deps import create_session, require_user
 from ..security import new_invite
 from .. import mailer
+from ..serializers import user_thumb_ref
 
 router = APIRouter()
 
@@ -157,7 +158,7 @@ def _user_dict(u: User) -> dict:
         # The server owner cannot delete their own account — the app hides the
         # delete-account row for them (the server also refuses it, 403).
         "isOwner": norm_email(u.email) == norm_email(config.ADMIN_EMAIL),
-        "thumb": f"/users/{u.id}/thumb" if u.thumb_path else None,
+        "thumb": user_thumb_ref(u),
         # Whether this user gets the "new music" email digest after a scan.
         "notifyNewMusic": bool(u.notify_new_music),
     }

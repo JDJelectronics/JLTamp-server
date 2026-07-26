@@ -10,6 +10,28 @@ from .ids import track_key, album_key, artist_key, playlist_key
 from .models import Artist, Album, Track, Playlist, UserTrackState
 
 
+def user_thumb_ref(user) -> str | None:
+    """`/users/<id>/thumb` with a version stamp, or None when there's no avatar.
+
+    The avatar always lands on the SAME path (`avatars/user_<id>.jpg`), so the
+    URL never changed when a user replaced their picture — clients cache by URL
+    and happily kept serving the old face. Stamping the file's mtime changes the
+    URL exactly when the image changes: caching still works, staleness doesn't.
+
+    Falls back to a bare URL if the file has vanished; the thumb endpoint deals
+    with a missing file on its own.
+    """
+    path = getattr(user, "thumb_path", None)
+    if not path:
+        return None
+    base = f"/users/{user.id}/thumb"
+    try:
+        import os
+        return f"{base}?v={int(os.path.getmtime(path))}"
+    except OSError:
+        return base
+
+
 def track_states(db, user_id: int, tracks) -> dict:
     """Load one user's play state for a batch of tracks: {track_id: state}.
     Callers pass `state=states.get(t.id)` into track_dict so viewCount /
