@@ -18,7 +18,7 @@ JLTamp does not provide, host, or distribute any music. It only plays media from
 - ❤️ Per‑user liked songs, playlists and play history
 - 🗂️ Plex‑style libraries with a **folder browser** + on‑demand scanning
 - 🖼️ Automatic album art & artist images (fetched from public music databases)
-- 📥 Import **Spotify / YouTube** playlists (and Plex playlists/likes) into your library
+- 📥 Rebuild a playlist from a shared link by matching its track list to your own files
 - 🚀 **Set up in the browser** — first‑run wizard creates your admin account
 - 📱 Works with the **JLTamp app** (Android + web)
 - 🔒 Passwords hashed, per‑user tokens, music mounted **read‑only**
@@ -72,7 +72,8 @@ cd JLTamp-server
    Plex‑style **folder browser** lets you click through the folders under your
    music mount (▸ to go into a folder, tap to select it), pick one or more, and
    run a **scan**. Your music then appears in the web app and the mobile app.
-   From the same screen you can also **import Spotify / YouTube playlists** and,
+   From the same screen you can also **rebuild a playlist from a link** — the
+   track list is matched against music you already have, nothing is fetched — and,
    if you run Plex, import your Plex playlists and likes.
 
 Your music is mounted **read‑only** — the server never modifies your files. All

@@ -15,11 +15,10 @@ services:
       # JLTAMP_PASSWORD: "a-strong-backup-password"
       # JLTAMP_ADMIN_EMAIL: "you@example.com"
       #
-      # Importing PUBLIC Spotify playlists needs a free app registered at
-      # developer.spotify.com — that path stays disabled until both are set.
-      # Importing from YouTube needs neither (yt-dlp reads the entry titles).
-      # SPOTIFY_CLIENT_ID: ""
-      # SPOTIFY_CLIENT_SECRET: ""
+      # Optional credentials for the playlist importer. Leave unset to keep that
+      # import path switched off.
+      # IMPORT_CLIENT_ID: ""
+      # IMPORT_CLIENT_SECRET: ""
     volumes:
       # ── EDIT THIS: point the left side at your music folder on the server ──
       - /path/to/your/music:/music:ro

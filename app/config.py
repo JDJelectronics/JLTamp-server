@@ -44,11 +44,11 @@ SERVER_NAME = os.environ.get("SERVER_NAME", "JLTamp")
 RESCAN_INTERVAL_MIN = int(os.environ.get("RESCAN_INTERVAL_MIN", "0") or 0)
 PORT = int(os.environ.get("PORT", "32400") or 32400)
 
-# Spotify Web API (client-credentials) for the playlist importer — read PUBLIC
-# playlists. Create a free app at developer.spotify.com and set these two env
-# vars; the importer's Spotify path is disabled until both are present.
-SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "").strip()
-SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "").strip()
+# Optional credentials for the playlist importer, which reads a public track
+# LISTING through an official API. Left empty by default; that import path stays
+# switched off until both are provided by the operator.
+IMPORT_CLIENT_ID = os.environ.get("IMPORT_CLIENT_ID", "").strip()
+IMPORT_CLIENT_SECRET = os.environ.get("IMPORT_CLIENT_SECRET", "").strip()
 
 # Optional LAN address (e.g. http://192.168.1.10:8090) the app can reach when
 # it's on the same network. Advertised to the client so it streams locally

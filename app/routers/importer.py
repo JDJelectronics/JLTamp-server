@@ -1,13 +1,15 @@
-"""Playlist importer — turn a Spotify or YouTube playlist link into a JLTamp
-playlist by matching each track (title + artist) against the user's OWN library.
+"""Playlist importer — rebuild a playlist from a shared link by matching each
+entry (title + artist) against the user's OWN library.
 
-Spotify: official Web API, client-credentials flow (public playlists only) — needs
-SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET. YouTube: yt-dlp extracts the entry
-titles (no API key), which are parsed into artist/title heuristically.
+**No media is fetched, decrypted or downloaded.** All this reads is a public
+track LISTING — names and artists, the same text a browser shows anyone who opens
+the link. Those names are then matched against files the operator already owns and
+has mounted; the music mount itself stays read-only. Entries with no match are
+reported back untouched, and nothing is created for them.
 
-Nothing is downloaded — we only read the track list and map it onto music the
-server already has (the music mount stays read-only). Unmatched tracks are
-reported back.
+The listing is read through an official API using credentials the operator
+registers themselves (IMPORT_CLIENT_ID / IMPORT_CLIENT_SECRET). Without those,
+this import path stays switched off.
 """
 from __future__ import annotations
 
@@ -107,12 +109,12 @@ _spotify_tok = {"token": "", "exp": 0.0}
 
 
 def _spotify_token() -> str:
-    if not (config.SPOTIFY_CLIENT_ID and config.SPOTIFY_CLIENT_SECRET):
+    if not (config.IMPORT_CLIENT_ID and config.IMPORT_CLIENT_SECRET):
         raise HTTPException(400, "Spotify import is not configured on this server")
     if _spotify_tok["token"] and _spotify_tok["exp"] > time.time() + 30:
         return _spotify_tok["token"]
     basic = base64.b64encode(
-        f"{config.SPOTIFY_CLIENT_ID}:{config.SPOTIFY_CLIENT_SECRET}".encode()
+        f"{config.IMPORT_CLIENT_ID}:{config.IMPORT_CLIENT_SECRET}".encode()
     ).decode()
     body = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode()
     req = urllib.request.Request(
@@ -177,68 +179,29 @@ def _fetch_spotify(url: str) -> tuple[str, list[dict]]:
     return name, items
 
 
-# ── YouTube (yt-dlp) ─────────────────────────────────────────────────────────
-_YT_NOISE = re.compile(r"\b(official\s*(music\s*)?video|official\s*audio|lyrics?|audio|hd|hq|mv|visualizer|4k)\b", re.I)
-
-
-def _parse_yt_title(raw: str, uploader: str) -> dict:
-    t = re.sub(r"\(.*?\)|\[.*?\]", " ", raw or "")
-    t = _YT_NOISE.sub(" ", t).strip(" -|·")
-    # Split on the FIRST "artist – title" separator: a dash/en-dash/em-dash that
-    # has a SPACE before it (so "Jay-Z", "T-Pain", "Hip-Hop" are NOT split).
-    # Catches "Artist - Song", "Artist -Song", "Artist – Song".
-    parts = re.split(r"\s+[-–—]\s*", t, maxsplit=1)
-    if len(parts) == 2 and parts[0].strip() and parts[1].strip():
-        return {"artist": parts[0].strip(), "title": parts[1].strip()}
-    up = re.sub(r"\s*-\s*topic$", "", uploader or "", flags=re.I).strip()
-    return {"artist": up, "title": t.strip()}
-
-
-def _fetch_youtube(url: str) -> tuple[str, list[dict]]:
-    try:
-        import yt_dlp  # heavy import — only when actually importing from YouTube
-    except Exception:
-        raise HTTPException(500, "YouTube import isn't available on this server")
-    opts = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist", "skip_download": True}
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception:
-        raise HTTPException(502, "Couldn't read that YouTube playlist")
-    entries = info.get("entries") or []
-    if not entries and info.get("title"):
-        entries = [info]  # single video link
-    name = info.get("title") or "YouTube playlist"
-    items = []
-    for e in entries:
-        if not e:
-            continue
-        parsed = _parse_yt_title(e.get("title", ""), e.get("uploader") or e.get("channel") or "")
-        if parsed["title"]:
-            items.append(parsed)
-    return name, items
-
-
 # ── endpoint ─────────────────────────────────────────────────────────────────
+# Only the official-API source is supported. A second source that scraped entry
+# titles out of a video site was removed on 2026-07-27: reading a listing through
+# a documented API with the operator's own credentials is a different thing from
+# extracting it out of a site that does not offer one, and only the first belongs
+# in a repo anyone can run.
 def _detect(url: str) -> str:
     u = (url or "").lower()
     if "spotify.com" in u or u.startswith("spotify:"):
         return "spotify"
-    if "youtube.com" in u or "youtu.be" in u:
-        return "youtube"
     return ""
 
 
 @router.post("/import/playlist")
 def import_playlist(url: str = "", title: str = "", user: User = Depends(require_user)):
-    """Fetch a Spotify/YouTube playlist, match it to the library, and create a
-    JLTamp playlist from the matches. Returns a report (matched / unmatched)."""
+    """Read a public playlist's track listing, match it to the library, and create
+    a JLTamp playlist from the matches. Returns a report (matched / unmatched)."""
     url = (url or "").strip()
     source = _detect(url)
     if not source:
-        raise HTTPException(400, "Paste a Spotify or YouTube playlist link")
+        raise HTTPException(400, "Paste a supported playlist link")
 
-    name, items = _fetch_spotify(url) if source == "spotify" else _fetch_youtube(url)
+    name, items = _fetch_spotify(url)
     if not items:
         raise HTTPException(404, "No tracks found in that playlist")
 
