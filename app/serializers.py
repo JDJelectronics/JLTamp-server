@@ -4,6 +4,8 @@ transformTrack reads Media[0].Part[0].key, grandparentTitle, parentThumb, etc.
 """
 from __future__ import annotations
 
+import hashlib
+
 from sqlalchemy import select
 
 from .ids import track_key, album_key, artist_key, playlist_key
@@ -51,6 +53,16 @@ def art_ref(rk: str | None) -> str | None:
     """A `thumb`/`art` path the app hands back to us via /photo/:/transcode or
     directly. `None` when the entity has no art (so the app shows a placeholder)."""
     return f"/art/{rk}" if rk else None
+
+
+def _track_thumb(t, rk: str, al_rk: str) -> str | None:
+    """Track cover URL. A track with its OWN per-track art (mixed folder) points at
+    /art/t{id}?v=<hash> — the `v` changes when the art file changes so a replaced
+    cover isn't served stale from cache. Normal tracks use the shared album cover."""
+    if t.art_path and "/artwork/trk_" in t.art_path:
+        v = hashlib.md5(t.art_path.encode("utf-8")).hexdigest()[:10]
+        return f"/art/{rk}?v={v}"
+    return art_ref(al_rk)
 
 
 def artist_dict(a: Artist) -> dict:
@@ -131,8 +143,13 @@ def track_dict(t: Track, playlist_item_id: int | None = None, state=None) -> dic
         "parentIndex": t.disc_no,
         "year": t.year,
         "genre": t.genre or "",
-        "thumb": art_ref(al_rk),                    # tracks show album cover
-        "art": art_ref(al_rk),
+        # Tracks normally show the album cover (shared → cache-friendly). But a
+        # track with its OWN per-track cover (mixed singles/Various-Artists folder,
+        # art extracted to artwork/trk_*) shows that instead — else the app would
+        # keep showing the wrong shared folder cover. The `?v=` token is derived
+        # from the (content-hashed) art file so a REPLACED cover busts client cache.
+        "thumb": _track_thumb(t, rk, al_rk),
+        "art": _track_thumb(t, rk, al_rk),
         "addedAt": t.added_at or 0,
         "lastViewedAt": (state.last_played_at if state else 0) or 0,
         "viewCount": (state.play_count if state else 0) or 0,

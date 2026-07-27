@@ -11,6 +11,7 @@ The music folders are mounted READ-ONLY — the scanner only ever reads them.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -316,6 +317,46 @@ def _resolve_album_art(album_id: int, sample_track: Path) -> str | None:
     return None
 
 
+# ── mixed folders: per-track cover art ───────────────────────────────────────
+# A bracketed "singles" folder — `[Singles]`, `[Singles & Loose Tracks]`, any
+# language — is a CONTAINER, not an album: it holds many unrelated tracks side by
+# side. The brackets are what distinguish it from a real album that happens to be
+# called "Singles" (those exist), so the folder cover is only overridden when the
+# name is bracketed.
+_SINGLES_DIR_RE = re.compile(r"[/\\]\[[^/\\]*singles[^/\\]*\][/\\]", re.IGNORECASE)
+
+
+def _is_singles_dir(path_str: str) -> bool:
+    return bool(_SINGLES_DIR_RE.search(path_str))
+
+
+def _is_mixed_folder(sp: str, album_artist: str) -> bool:
+    """Folders that mix many DIFFERENT albums under one directory: a bracketed
+    singles folder, or a Various-Artists compilation. There the shared folder
+    cover.jpg is wrong for most tracks, so each track should show its OWN embedded
+    cover instead. Normal album folders keep the (correct) album cover."""
+    return (_is_singles_dir(sp)
+            or album_artist.strip().lower() in ("various artists", "various", "va"))
+
+
+def _resolve_track_art(sp: str, album_art: str | None) -> str | None:
+    """Per-track cover for tracks in mixed folders: the file's OWN embedded art,
+    extracted to the data dir. Falls back to the album/folder art when the file
+    has no embedded picture."""
+    data = _embedded_art_bytes(Path(sp))
+    if not data:
+        return album_art
+    # Name by CONTENT hash so replacing the embedded cover changes the filename
+    # (and thus the served art URL) — otherwise clients keep the cached image.
+    out = config.ARTWORK_DIR / f"trk_{hashlib.md5(data).hexdigest()}.jpg"
+    try:
+        out.write_bytes(data)
+        return str(out)
+    except Exception as e:
+        log.warning("track art write failed: %s", e)
+        return album_art
+
+
 # ── ignore files (Plex-style) ────────────────────────────────────────────────
 # Drop a `.plexignore` (or `.jltampignore`) file in a folder to keep the scanner
 # out of it — exactly like Plex. An EMPTY file, or one containing `*`, ignores the
@@ -515,6 +556,20 @@ def scan_library(library_id: int, full: bool = False, keep_new: bool = False) ->
                     track_no = _int(_first(tags, "tracknumber"))
                     disc_no = _int(_first(tags, "discnumber"))
 
+                    # Singles folders: collapse every single into ONE collection tied
+                    # to the FOLDER artist, ignoring its source-album ID3 tag.
+                    # Otherwise each single's album tag spawns a phantom 1-track
+                    # "album" whose cover falls back to the shared folder cover — or,
+                    # for collaborations, to a DIFFERENT artist's folder cover. The
+                    # real performer is kept below as orig_artist; per-track covers
+                    # (mixed-folder branch) are unaffected. Layout assumed:
+                    # <Artist>/[Singles ...]/<file>
+                    if _is_singles_dir(sp):
+                        album_title = path.parent.name          # the [Singles ...] folder
+                        folder_artist = path.parent.parent.name
+                        if folder_artist:
+                            album_artist = folder_artist
+
                     container, codec, bits = _container_codec(path, info)
                     # Loudness normalisation: prefer the track ReplayGain tag, fall
                     # back to album gain. NULL when neither is present (phase 2 will
@@ -532,6 +587,14 @@ def scan_library(library_id: int, full: bool = False, keep_new: bool = False) ->
                     _scan_state["current"] = f"{album_artist} — {album_title}"
                     orig_artist = track_artist if track_artist and track_artist != album_artist else ""
 
+                    # In "mixed" folders (singles / Various Artists) the shared folder
+                    # cover is wrong for most tracks — give each track its own embedded
+                    # cover. Elsewhere keep inheriting the (correct) album cover.
+                    if _is_mixed_folder(sp, album_artist):
+                        track_art = _resolve_track_art(sp, album.art_path)
+                    else:
+                        track_art = album.art_path
+
                     fields = dict(
                         library_id=library_id,
                         title=title, sort_title=_sort_key(title),
@@ -541,14 +604,19 @@ def scan_library(library_id: int, full: bool = False, keep_new: bool = False) ->
                         track_no=track_no, disc_no=disc_no, duration_ms=duration_ms, genre=genre, year=year,
                         path=sp, ext=path.suffix.lower(), container=container, codec=codec,
                         bitrate=bitrate, channels=channels, samplerate=samplerate, bits=bits,
-                        size=st.st_size, mtime=st.st_mtime, art_path=album.art_path,
+                        size=st.st_size, mtime=st.st_mtime, art_path=track_art,
                         added_at=int(st.st_ctime), gain_db=gain_db,
                     )
                     if prev:
                         for k, v in fields.items():
                             setattr(prev, k, v)
                     else:
-                        db.add(Track(**fields))
+                        new_t = Track(**fields)
+                        db.add(new_t)
+                        # Guard against a path being yielded twice in one scan run: without
+                        # this the second occurrence would db.add() a duplicate path and the
+                        # batch INSERT dies on the UNIQUE(path) constraint, aborting the scan.
+                        existing[sp] = new_t
                         _note_new_track(library_id, artist.name, title, album.title)
                     count += 1
                     # Commit FREQUENTLY: get_artist/get_album flush() opens a write
