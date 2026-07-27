@@ -128,6 +128,17 @@ If you'd rather build your own compatible service, the app expects:
   `{ "status": "processing", "job_id": "…", "poll_interval": 1000 }`
 - `GET /ai/status?job_id=…` → job progress / result
 
+Also served, and useful when wiring this up yourself:
+
+- `GET /health` → track/vector counts and the loaded model. Open (no key): the app
+  has to be able to find the service before it can authenticate.
+- `GET /whoami` → the address this service sees itself on, for discovery. Open.
+- `POST /ai/weekly` → the weekly DNA / Discovery playlists
+- `POST /ai/radio` → an endless station seeded from what is playing
+
+Everything except `/health` and `/whoami` requires `X-AI-Key` once `AI_API_KEY`
+is set.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

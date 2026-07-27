@@ -223,7 +223,25 @@ def genres(key: str, user: User = Depends(require_user)):
         stmt = _scope(select(Track.genre, func.count(Track.id)), Track, allowed, section) \
             .where(Track.genre != "").group_by(func.lower(Track.genre)).order_by(func.lower(Track.genre))
         rows = db.execute(stmt).all()
-        directory = [{"key": g, "title": g, "count": c} for g, c in rows if g and len(g) >= 2]
+
+        # A representative album cover per genre (an album in that genre that has
+        # real art), so the browse tiles can show a picture instead of a flat tint.
+        art_stmt = _scope(select(func.lower(Track.genre), func.min(Album.id)), Track, allowed, section) \
+            .join(Album, Album.id == Track.album_id) \
+            .where(Track.genre != "") \
+            .where(Album.art_path.isnot(None) | Album.online_art_path.isnot(None)) \
+            .group_by(func.lower(Track.genre))
+        art_map = {g: aid for g, aid in db.execute(art_stmt).all()}
+
+        directory = []
+        for g, c in rows:
+            if not g or len(g) < 2:
+                continue
+            entry = {"key": g, "title": g, "count": c}
+            aid = art_map.get(g.lower())
+            if aid:
+                entry["thumb"] = f"/art/al{aid}"   # → getThumbnailUrl on the client
+            directory.append(entry)
         return {"MediaContainer": {"size": len(directory), "Directory": directory}}
     finally:
         db.close()

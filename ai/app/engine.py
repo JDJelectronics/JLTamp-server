@@ -22,6 +22,14 @@ from .jltamp_client import JLTampClient, JLTampError, Library, Track
 BEST_OF_TRIGGERS = ("leukste", "beste", "best of", "songs van", "playlist van", "top van")
 DISCOVERY_TRIGGERS = ("vergelijkbaar", "similar", "discovery", "radio", "lijkt op",
                       "zoals", "in de stijl van", "familiair")
+# A wind-down is an *ordering* intent, not just "calm music": the tempo has to
+# descend. So these are explicit descent / sleep cues — plain "rustige muziek"
+# is deliberately left out so it still gets a normal calm playlist, not a ramp.
+WIND_DOWN_TRIGGERS = ("afbouw", "afbouwen", "wind down", "wind-down", "winddown",
+                      "in slaap", "inslapen", "slapen", "om te slapen",
+                      "steeds rustiger", "aflopend tempo", "tempo omlaag",
+                      "tot rust komen", "cool down", "cooldown",
+                      "afkoelen", "naar rust")
 ARTIST_SPLITTERS = ("zoals ", "lijkt op ", "van ", "voor ", "artiest ", "artist ",
                     "bij ", "naar ")
 
@@ -70,14 +78,25 @@ class Engine:
             print(f"❌ JLTamp login failed: {e}")
             return
 
-        try:
-            count = self.library.refresh(self.features)
-            self._apply_inferred()
-            print(f"✅ JLTamp connected: {count} tracks.")
-        except Exception as e:                      # noqa: BLE001
-            self.status = "jltamp-unreachable"
-            self.last_error = str(e)
-            print(f"❌ Could not load the library: {e}")
+        # Retry the initial load: a transient JLTamp hiccup at boot (a restart,
+        # a moment of load) used to leave the engine permanently dead until
+        # someone noticed and restarted it. Back off and keep trying.
+        for attempt in range(1, 13):
+            try:
+                count = self.library.refresh(self.features)
+                self._apply_inferred()
+                print(f"✅ JLTamp connected: {count} tracks.")
+                break
+            except Exception as e:                  # noqa: BLE001
+                self.status = "jltamp-unreachable"
+                self.last_error = str(e)
+                wait = min(30, attempt * 5)
+                print(f"⚠️  Library load failed (attempt {attempt}): {e} — "
+                      f"retrying in {wait}s")
+                self.client.refresh_connection()    # drop any half-dead socket
+                time.sleep(wait)
+        else:
+            print("❌ Could not load the library after repeated attempts.")
             return
 
         print(f"🔍 Waiting for the embedding server at {config.EMBED_URL} ...")
@@ -186,7 +205,7 @@ class Engine:
             if genre_infer.is_placeholder(t.genre):
                 g = self.inferred_genres.get(t.rating_key)
                 if g:
-                    t.genre = g
+                    t.inferred_genre = g    # separate field — never enters text
                     n += 1
         if n:
             print(f"🏷️  Applied inferred genre to {n} untagged tracks.")
@@ -296,6 +315,11 @@ class Engine:
         if not self.ready:
             return self._fallback(tracks, prompt, client)
 
+        # Wind-down is checked before artist strategies: "afbouw playlist met
+        # Coldplay" is a tempo ramp flavoured by an artist, not a best-of.
+        if any(w in low for w in WIND_DOWN_TRIGGERS):
+            return self.wind_down(prompt, tracks, client)
+
         artist = self._find_artist(low, tracks)
         if artist and any(w in low for w in BEST_OF_TRIGGERS):
             return self._best_of(artist, tracks, client)
@@ -333,6 +357,75 @@ class Engine:
         if not present:
             return None
         return mat.mean(axis=0)
+
+    def radio(self, seed: str, exclude: set[str], count: int = 20) -> dict:
+        """The next batch of an endless 'more like this' station.
+
+        `seed` is a track key ("t123") or an artist name. `exclude` is what has
+        already played or is queued, so repeated calls advance through the
+        nearest tracks rather than returning the same ones. Stateless on
+        purpose: the app owns the growing exclude set, which keeps it naturally
+        per-user and lets the station run forever without the engine tracking
+        sessions.
+
+        Stays close to the seed — this is a station, not a journey — so it is
+        pure nearest-neighbour with only a tie-break jitter, no drift.
+        """
+        if not self.ready or self.store is None:
+            return {"status": "error", "message": "engine niet gereed"}
+        tracks = self.library.snapshot()
+        by_key = {t.rating_key: t for t in tracks}
+
+        # Resolve the seed to a target vector: a known track key, else an
+        # artist centroid.
+        target = None
+        label = seed
+        if seed in by_key:
+            mat, present = self.store.matrix([seed])
+            if present:
+                target = mat[0]
+                st = by_key[seed]
+                label = f"{st.real_artist} - {st.clean_title}"
+        if target is None:
+            target = self._artist_vector(seed, tracks)
+        if target is None:
+            return {"status": "error",
+                    "message": f"kon geen radio starten vanaf '{seed}'"}
+
+        skip = set(exclude)
+        skip.add(seed)                       # never replay the seed itself
+        rng = random.Random()
+        picks: list[Track] = []
+        # Pull a wide band, then keep the nearest that are not excluded. The
+        # band grows the deeper the station runs (exclude gets large), so ask
+        # for generously more than needed.
+        band = self.store.top_keys(target, [t.rating_key for t in tracks],
+                                   count + len(skip) + 200)
+        seen_artist: dict[str, int] = {}
+        for key, _sim in band:
+            if key in skip:
+                continue
+            t = by_key.get(key)
+            if t is None or any(k in t.haystack for k in scoring.KIDS_WORDS):
+                continue
+            # Loose per-artist cap so a station does not become one artist on
+            # repeat, but still stays firmly in the seed's neighbourhood.
+            a = t.real_artist
+            if seen_artist.get(a, 0) >= 3:
+                continue
+            picks.append(t)
+            seen_artist[a] = seen_artist.get(a, 0) + 1
+            if len(picks) >= count:
+                break
+
+        rng.shuffle(picks)                   # mild ordering variety within the batch
+        return {
+            "status": "ok",
+            "seed": label,
+            "tracks": [{"ratingKey": t.rating_key,
+                        "title": t.clean_title,
+                        "artist": t.real_artist} for t in picks],
+        }
 
     def _best_of(self, artist: str, tracks: list[Track], client) -> dict:
         own = [t for t in tracks if t.artist.lower() == artist.lower()]
@@ -393,6 +486,59 @@ class Engine:
         if not picked:
             return {"status": "error", "message": "niets gevonden dat hierbij past"}
         return self._publish(scoring.playlist_name(low), picked, client)
+
+    # ── wind-down: a tempo curve that descends to calm ───────────────────────
+    def _winddown_pool(self, prompt: str, tracks: list[Track], client
+                       ) -> list[Track]:
+        """Candidate tracks for a wind-down: the caller's own favourites, plus
+        whatever the prompt asks for, so 'rustige jazz om te slapen' stays jazzy
+        while a bare 'afbouw playlist' still draws on *their* music.
+
+        Kids' tracks are dropped — a wind-down is not a nursery playlist.
+        """
+        by_key = {t.rating_key: t for t in tracks}
+        pool: dict[str, Track] = {}
+
+        # Prompt-driven half — honour any genre / mood the user typed.
+        prompt = (prompt or "").strip()
+        if prompt:
+            try:
+                query = self.embedder.embed_one(scoring.expand_query(prompt))
+                sims = scoring.similarity_map(self.store, query, tracks)
+                for t, _ in scoring.score_tracks(prompt, tracks, sims)[:250]:
+                    pool[t.rating_key] = t
+            except Exception as e:                  # noqa: BLE001
+                print(f"⚠️  wind-down semantic pool failed: {e}")
+
+        # Personal half — the caller's own favourites.
+        try:
+            for key in client.most_played_ids(80) + list(client.liked_ids()):
+                t = by_key.get(key)
+                if t:
+                    pool[t.rating_key] = t
+        except Exception as e:                      # noqa: BLE001
+            print(f"⚠️  wind-down favourites failed: {e}")
+
+        return [t for t in pool.values()
+                if not any(k in t.haystack for k in scoring.KIDS_WORDS)]
+
+    def wind_down(self, prompt: str, tracks: list[Track], client) -> dict:
+        """A playlist whose tempo glides down to something you could sleep to.
+
+        Built from the caller's own taste (and whatever the prompt asks for),
+        so it is personal and lands in their own account. Only tracks with a
+        measured tempo can sit on a tempo curve, so those are all it uses.
+        """
+        pool = self._winddown_pool(prompt, tracks, client)
+        graded = [(t, t.features.get("bpm")) for t in pool]
+        graded = [(t, b) for t, b in graded if b]
+        if len(graded) < 12:
+            return {"status": "error",
+                    "message": "te weinig nummers met een gemeten tempo voor "
+                               "een afbouw-playlist"}
+        curve = scoring.descending_tempo_curve(
+            graded, config.SCORING["MAX_TRACKS"])
+        return self._publish("🌙 Afbouw — rustig naar het einde", curve, client)
 
     def _fallback(self, tracks: list[Track], prompt: str, client) -> dict:
         """No AI available — still give the user music rather than an error."""

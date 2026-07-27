@@ -65,14 +65,14 @@ def main() -> int:
         if not picked:
             print(f"    0%  {genre!r} — leeg")
             continue
-        hit = sum(1 for t in picked if genre in t.genre.strip().lower())
+        hit = sum(1 for t in picked if genre in t.match_genre.strip().lower())
         frac = hit / len(picked)
         total += frac
         good += frac >= 0.5
         mark = "✅" if frac >= 0.5 else ("⚠️ " if frac >= 0.25 else "❌")
         print(f"  {mark} {frac:4.0%}  {genre:24} ({n} tracks in de bibliotheek)")
         if args.verbose and frac < 0.5:
-            for t in [t for t in picked if genre not in t.genre.lower()][:3]:
+            for t in [t for t in picked if genre not in t.match_genre.lower()][:3]:
                 print(f"         mis: {t.real_artist} - {t.clean_title[:34]} [{t.genre}]")
 
     if cases:

@@ -129,7 +129,25 @@ def expand_query(prompt: str) -> str:
     # tracks the embedding had found (0.745+) dropped out entirely.
     if any(w.strip(",.").lower() in GENERIC_MUSIC_WORDS for w in words):
         return f"{prompt}, genre {prompt}"
-    return f"{prompt}, {prompt} muziek, genre {prompt}"
+    # Anchor word in the prompt's own language. "muziek" is Dutch, and adding
+    # it to an English genre term dragged the whole query toward Dutch tracks:
+    # "alternative" returned Dutch schlager (Arnold Hofmans, De Alpenzusjes),
+    # while "alternative music" returns Muse and Radiohead. The prompt's script
+    # is the tell — a Dutch prompt keeps "muziek", an English one gets "music".
+    anchor = "muziek" if _looks_dutch_prompt(prompt) else "music"
+    return f"{prompt}, {prompt} {anchor}, genre {prompt}"
+
+
+# Dutch mood/genre words a short prompt might use — enough to pick the anchor
+# language. Not exhaustive: on a miss it defaults to English "music", which is
+# the safe choice since most genre terms are English.
+_DUTCH_PROMPT_HINT = re.compile(
+    r"\b(rustig|vrolijk|verdrietig|feest|slapen|kinder|kerst|zomer|winter|"
+    r"nederlands|hollands|liefde|hard|zacht|snel|langzaam|meezing|gezellig)\w*")
+
+
+def _looks_dutch_prompt(prompt: str) -> bool:
+    return bool(_DUTCH_PROMPT_HINT.search(prompt.lower()))
 
 
 def extract_year(prompt: str) -> int | None:
@@ -164,6 +182,49 @@ def exclusions(prompt: str) -> list[str]:
     """
     return re.findall(
         r"\b(?:zonder|geen|niet|no|exclude|behalve)\s+(\w+)", prompt)
+
+
+def descending_tempo_curve(graded: list[tuple[Track, float]],
+                           count: int, per_artist: int = 3) -> list[Track]:
+    """Order tracks into a smooth downward tempo ramp.
+
+    `graded` is (track, bpm) pairs; every track must carry a measured tempo,
+    because ordering by a tempo we do not have is just ordering at random. The
+    playlist starts near a normal listening tempo and glides down, track by
+    track, to something calm — a wind-down.
+
+    The endpoints are percentiles of what the pool actually contains (75th down
+    to 10th), not fixed numbers: a library that skews slow should still descend,
+    just over a lower range. At each step we take the unused track whose tempo
+    sits closest to where the glide line is — so the descent is built from real
+    tracks and stays gradual instead of jumping.
+
+    No artist takes more than `per_artist` slots: a library heavy in one act
+    (a sleep-music label with hundreds of near-identical ambient tracks, say)
+    would otherwise fill the whole curve by itself. When every remaining artist
+    is capped we still take the closest track rather than leave a gap.
+    """
+    if not graded:
+        return []
+    bpms = sorted(b for _, b in graded)
+    hi = bpms[min(len(bpms) - 1, int(len(bpms) * 0.75))]
+    lo = bpms[max(0, int(len(bpms) * 0.10))]
+    if hi <= lo:                      # too little spread to shape a curve
+        hi, lo = bpms[-1], bpms[0]
+    n = min(count, len(graded))
+    pool = list(graded)
+    curve: list[Track] = []
+    used: dict[str, int] = {}
+    for i in range(n):
+        target = hi - (hi - lo) * (i / max(1, n - 1))
+        order = sorted(range(len(pool)), key=lambda k: abs(pool[k][1] - target))
+        pick = next((k for k in order
+                     if used.get(pool[k][0].real_artist.lower(), 0) < per_artist),
+                    order[0])
+        t = pool.pop(pick)[0]
+        used[t.real_artist.lower()] = used.get(t.real_artist.lower(), 0) + 1
+        curve.append(t)
+    return curve
 
 
 def audio_fit(track: Track, contexts: list[str]) -> float:
@@ -265,7 +326,7 @@ def named_genres(prompt: str, tracks: list[Track]) -> set[str]:
     # avoid — and it fell from 76% to 62%. "hardcore" is a request for a tag;
     # "nederlandse pop" is a description that happens to contain one.
     prompt_l = prompt.lower().strip()
-    return {t.genre.strip().lower() for t in tracks if t.genre.strip()} & {prompt_l}
+    return {t.match_genre.strip().lower() for t in tracks if t.match_genre.strip()} & {prompt_l}
 
 
 def score_tracks(prompt: str, tracks: list[Track], similarity: dict[str, float],
@@ -324,7 +385,7 @@ def score_tracks(prompt: str, tracks: list[Track], similarity: dict[str, float],
 
         # Carrying the tag the user named beats merely sounding like it.
         if asked_genres:
-            tag = t.genre.strip().lower()
+            tag = t.match_genre.strip().lower()
             # Exact tag, not a substring: `g in tag` let "pop" claim every
             # "nederpop", "synthpop" and "pop rock" track in the library.
             if tag and tag in asked_genres:

@@ -72,7 +72,7 @@ def _apply_inferred(tracks: list[Track]) -> int:
     n = 0
     for t in tracks:
         if genre_infer.is_placeholder(t.genre) and overlay.get(t.rating_key):
-            t.genre = overlay[t.rating_key]
+            t.inferred_genre = overlay[t.rating_key]
             n += 1
     return n
 

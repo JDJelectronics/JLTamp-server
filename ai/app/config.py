@@ -70,7 +70,11 @@ JLTAMP_PASSWORD = _env("JLTAMP_PASSWORD")
 # ── Embedding server (llama.cpp on the Jetson's GPU) ──────────────────────────
 EMBED_URL = _env("EMBED_URL", "http://127.0.0.1:3100").rstrip("/")
 EMBED_ENDPOINT = f"{EMBED_URL}/embedding"
-EMBED_BATCH = _env_int("EMBED_BATCH", 64)
+# 256 measured ~1.8x faster than 64 on the Xavier (9.4 vs 5.2 tracks/s): bigger
+# batches amortise llama.cpp's per-request overhead. Past ~256 it flattens
+# (512 → 11.7/s) while each request creeps toward the timeout, so 256 is the
+# balance. A 256-track batch takes ~27s, comfortably under EMBED_TIMEOUT.
+EMBED_BATCH = _env_int("EMBED_BATCH", 256)
 EMBED_TIMEOUT = _env_int("EMBED_TIMEOUT", 120)
 
 # ── This service ─────────────────────────────────────────────────────────────

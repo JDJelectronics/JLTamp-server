@@ -177,6 +177,21 @@ class Playlist(Base):
     title: Mapped[str] = mapped_column(String)
     created_at: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[int] = mapped_column(Integer, default=0)
+    # Set the first time the owner shares this playlist — a short opaque code used
+    # to join it (link / QR / on-network invite). Null = private (never shared).
+    share_code: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+
+
+class PlaylistMember(Base):
+    """A user who was invited into a shared (collaborative) playlist. The owner is
+    NOT stored here — ownership stays on Playlist.user_id; membership is everyone
+    else who joined via the share code. Any member may add/remove tracks."""
+    __tablename__ = "playlist_members"
+    __table_args__ = (UniqueConstraint("playlist_id", "user_id", name="uq_playlist_member"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    playlist_id: Mapped[int] = mapped_column(ForeignKey("playlists.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    joined_at: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class PlaylistItem(Base):
@@ -186,6 +201,9 @@ class PlaylistItem(Base):
     playlist_id: Mapped[int] = mapped_column(ForeignKey("playlists.id"), index=True)
     track_id: Mapped[int] = mapped_column(ForeignKey("tracks.id"), index=True)
     position: Mapped[int] = mapped_column(Integer, default=0)
+    # Who added this track (for shared-playlist attribution). Null on old rows /
+    # single-user playlists — the client falls back to the owner then.
+    added_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
 
 
 class LikedTrack(Base):

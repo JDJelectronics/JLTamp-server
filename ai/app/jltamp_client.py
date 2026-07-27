@@ -42,6 +42,12 @@ class Track:
     skips: int = 0
     liked: bool = False
     features: dict = field(default_factory=dict)
+    # A genre guessed from embedding neighbours when the real one is a
+    # placeholder. Kept SEPARATE from `genre` on purpose: it feeds matching and
+    # the genre boost, but must never enter the embedding text — a wrong guess
+    # baked into the vector made Dutch schlager literally contain the word
+    # "alternative" and match that query. Vectors are built from real data only.
+    inferred_genre: str = ""
 
     # Placeholders a compilation uses where a real artist name would go.
     _COMPILATION = {"various artists", "various", "va", "verschillende artiesten",
@@ -95,10 +101,17 @@ class Track:
         return " - ".join(b for b in bits if b)
 
     @property
+    def match_genre(self) -> str:
+        """The genre to match and score against: the real one, or the inferred
+        guess when the real one is missing/placeholder. NOT what gets embedded —
+        `text` uses only the real genre so a guess cannot corrupt the vector."""
+        return self.inferred_genre if self.inferred_genre else self.genre
+
+    @property
     def haystack(self) -> str:
         """Lowercased blob for keyword/exclusion matching."""
         return (f"{self.artist} {self.orig_artist} {self.title} "
-                f"{self.album} {self.genre}").lower()
+                f"{self.album} {self.match_genre}").lower()
 
 
 class JLTampError(RuntimeError):

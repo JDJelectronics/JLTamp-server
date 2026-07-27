@@ -155,9 +155,10 @@ async def session_ws(websocket: WebSocket, code: str):
         or getattr(user, "username", None)
         or f"User {user.id}"
     )
-    # A URL, not the raw thumb_path. This handed clients a SERVER FILESYSTEM
-    # path, which no client can load — so every participant showed a broken
-    # avatar.
+    # A URL, not the raw thumb_path. This handed clients a SERVER FILESYSTEM path
+    # (e.g. /data/avatars/user_3.jpg), which no client can load — so every
+    # Listen Together participant showed a broken avatar. The presence handler
+    # below always built a proper URL; this one was simply missed.
     thumb = user_thumb_ref(user)
     is_host = user.id == s.host_user_id
     s.participants[user.id] = Participant(
@@ -224,15 +225,17 @@ async def session_ws(websocket: WebSocket, code: str):
                 s.track = msg.get("track")
                 s.queue = msg.get("queue", s.queue)
                 s.position_ms = int(msg.get("positionMs", 0))
-                # Honour the host's real play state instead of assuming True: a
-                # host promoted mid-session republishes its current track while it
-                # may be PAUSED, which otherwise started every guest against a
-                # silent host. Defaults to True for older clients.
+                # Honour the host's real play state instead of assuming True.
+                # A host promoted mid-session republishes its current track while
+                # it may be PAUSED; hardcoding True made every guest start
+                # playing against a silent host. Defaults to True so an older
+                # client that omits the field behaves exactly as before.
                 s.is_playing = bool(msg.get("isPlaying", True))
                 s.anchor_ts = _now_ms() + 700  # scheduled start ~700ms ahead
                 await _broadcast(s, {
                     "t": "track", "track": s.track, "queue": s.queue,
-                    "positionMs": s.position_ms, "isPlaying": s.is_playing, "startAtServerTs": s.anchor_ts,
+                    "positionMs": s.position_ms, "isPlaying": s.is_playing,
+                    "startAtServerTs": s.anchor_ts,
                     "serverTs": _now_ms(),
                 }, exclude=user.id)
             elif t == "play":
@@ -276,22 +279,168 @@ async def session_ws(websocket: WebSocket, code: str):
     except Exception:
         pass
     finally:
-        # Was this the host at the moment they left? (They may have been promoted
-        # to host mid-session, so check the live host id, not the join-time flag.)
-        was_host = (user.id == s.host_user_id)
-        s.participants.pop(user.id, None)
-        if not s.participants:
-            # Empty room → tear the session down.
-            MANAGER.remove(code)
-        elif was_host:
-            # Host left but listeners remain → promote the longest-present one
-            # (dict preserves insertion order) instead of ending the session.
-            new_host = next(iter(s.participants.values()))
-            s.host_user_id = new_host.user_id
-            new_host.is_host = True
-            await _broadcast(s, {
-                "t": "host", "hostUserId": new_host.user_id,
-                "participants": _participants_payload(s),
-            })
-        else:
-            await _broadcast(s, {"t": "participants", "participants": _participants_payload(s)})
+        # Only clean up if the roster still points at THIS socket. On an abrupt
+        # drop the client reconnects and re-registers under the same user_id BEFORE
+        # this ghost's finally runs; without this guard we'd pop the freshly
+        # reconnected participant (silent desync / wrong host-migration / room
+        # teardown). If a newer socket owns the slot, leave everything alone.
+        cur = s.participants.get(user.id)
+        if cur is not None and cur.ws is websocket:
+            # Was this the host at the moment they left? (They may have been promoted
+            # to host mid-session, so check the live host id, not the join-time flag.)
+            was_host = (user.id == s.host_user_id)
+            s.participants.pop(user.id, None)
+            if not s.participants:
+                # Empty room → tear the session down.
+                MANAGER.remove(code)
+            elif was_host:
+                # Host left but listeners remain → promote the longest-present one
+                # (dict preserves insertion order) instead of ending the session.
+                new_host = next(iter(s.participants.values()))
+                s.host_user_id = new_host.user_id
+                new_host.is_host = True
+                await _broadcast(s, {
+                    "t": "host", "hostUserId": new_host.user_id,
+                    "participants": _participants_payload(s),
+                })
+            else:
+                await _broadcast(s, {"t": "participants", "participants": _participants_payload(s)})
+
+
+# ── Local presence + discovery ───────────────────────────────────────────────
+# Everyone logged into this server opens a lightweight presence WebSocket. The
+# server groups clients by the network it sees them coming from (same LAN /24, or
+# the same NAT public IP), so people on the same Wi-Fi can see each other and send
+# a DIRECT invite — no code or QR. The invite just carries a session code the
+# invited client joins.
+presence_router = APIRouter(prefix="/presence", tags=["presence"])
+
+
+@dataclass
+class Peer:
+    user_id: int
+    name: str
+    thumb: str | None
+    net: str
+    ws: WebSocket
+    session_code: str | None = None
+
+
+class PresenceManager:
+    def __init__(self) -> None:
+        self.peers: dict[int, Peer] = {}   # user_id → Peer (one presence per user)
+
+    @staticmethod
+    def net_of(ip: str) -> str:
+        """Discovery grouping key. JLTamp is a single-household, invite-only server:
+        everyone who is logged in is trusted, so Listen Together discovery is ONE
+        shared pool — you see every other signed-in device, web or app.
+
+        (The previous per-/24 split isolated web users, who arrive via the Caddy
+        reverse proxy as 172.21.x, from phones on the LAN reaching the server
+        directly as 192.168.x — so web and app could never discover each other.
+        `ip` is kept in the signature for callers/back-compat but ignored.)"""
+        return "all"
+
+
+PRESENCE = PresenceManager()
+
+
+def _presence_client_ip(ws: WebSocket) -> str:
+    xff = ws.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return ws.client.host if ws.client else ""
+
+
+def _peer_list(net: str, exclude: int | None = None) -> list:
+    return [
+        {"userId": p.user_id, "name": p.name, "thumb": p.thumb,
+         "inSession": p.session_code is not None}
+        for p in PRESENCE.peers.values()
+        if p.net == net and p.user_id != exclude
+    ]
+
+
+async def _presence_push_lists(net: str) -> None:
+    """Send every peer on this network its OWN peer list (excluding itself), so no
+    one ever sees themselves in 'people on your network'."""
+    for p in list(PRESENCE.peers.values()):
+        if p.net == net:
+            try:
+                await p.ws.send_text(json.dumps({"t": "peers", "peers": _peer_list(net, exclude=p.user_id)}))
+            except Exception:
+                pass
+
+
+@presence_router.websocket("/ws")
+async def presence_ws(websocket: WebSocket):
+    token = websocket.query_params.get("X-Plex-Token")
+    user = _user_for_token(token)
+    if not user:
+        await websocket.close(code=4401)
+        return
+    await websocket.accept()
+
+    net = PresenceManager.net_of(_presence_client_ip(websocket))
+    name = (
+        getattr(user, "display_name", None)
+        or getattr(user, "username", None)
+        or f"User {user.id}"
+    )
+    thumb = user_thumb_ref(user)
+    PRESENCE.peers[user.id] = Peer(user_id=user.id, name=name, thumb=thumb, net=net, ws=websocket)
+
+    # Refresh everyone on this network (incl. the newcomer) with their own list.
+    await _presence_push_lists(net)
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            t = msg.get("t")
+
+            if t == "ping":
+                await websocket.send_text(json.dumps({"t": "pong"}))
+                continue
+
+            # Advertise which session (if any) this user is hosting/in, so peers
+            # see who's already listening.
+            if t == "setSession":
+                p = PRESENCE.peers.get(user.id)
+                if p:
+                    p.session_code = (msg.get("code") or None)
+                    await _presence_push_lists(net)
+                continue
+
+            # Direct invite: relay a code to a peer ON THE SAME NETWORK. `kind`
+            # says whether it's a Listen Together session or a shared playlist.
+            if t == "invite":
+                target = PRESENCE.peers.get(msg.get("toUserId"))
+                code = msg.get("code")
+                if target and target.net == net and code:
+                    try:
+                        await target.ws.send_text(json.dumps({
+                            "t": "invited", "fromUserId": user.id,
+                            "fromName": name, "code": code,
+                            "kind": msg.get("kind") or "session",
+                            "title": msg.get("title") or "",
+                        }))
+                    except Exception:
+                        pass
+                continue
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        # Same reconnect guard as session_ws: only evict if the roster still points
+        # at THIS socket, so a reconnect (which re-registers first) isn't removed by
+        # the ghost's finally.
+        cur = PRESENCE.peers.get(user.id)
+        if cur is not None and cur.ws is websocket:
+            PRESENCE.peers.pop(user.id, None)
+            await _presence_push_lists(net)

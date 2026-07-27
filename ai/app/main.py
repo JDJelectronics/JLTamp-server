@@ -186,6 +186,25 @@ def weekly():
     return jsonify({"results": results})
 
 
+@app.post("/ai/radio")
+def radio():
+    """Next batch of an endless station seeded by a track or artist.
+
+    Body: {"seed": "t123" | "Adele", "exclude": ["t1", ...], "count": 20}.
+    The client keeps calling with a growing `exclude` to keep its queue full.
+    """
+    token = _caller_token()
+    if config.REQUIRE_USER_TOKEN and not engine.user_context(token):
+        return jsonify({"error": "ongeldig of ontbrekend JLTamp-token"}), 401
+    body = request.get_json(silent=True) or {}
+    seed = (body.get("seed") or "").strip()
+    if not seed:
+        return jsonify({"error": "seed is leeg"}), 400
+    exclude = set(str(x) for x in (body.get("exclude") or []))
+    count = min(int(body.get("count") or 20), 50)
+    return jsonify(engine.radio(seed, exclude, count))
+
+
 @app.get("/ai/status")
 def status():
     job = jobs.get(request.args.get("job_id", ""))
