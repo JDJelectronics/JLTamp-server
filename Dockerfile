@@ -15,6 +15,21 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
+# Guard: a name Python can't resolve (missing import, typo) is NOT an import
+# error. The module loads, the container reports healthy and /healthz is green —
+# the NameError only fires on the first request that reaches that line, so a
+# single endpoint 500s in production while everything looks fine. pyflakes finds
+# undefined names statically, so the build fails instead of the server. Only
+# "undefined name" blocks; style and unused-import warnings do not.
+RUN pip install --no-cache-dir pyflakes==3.4.0 \
+    && { python -m pyflakes app || true; } | grep "undefined name" > /tmp/undefined.txt; \
+    if [ -s /tmp/undefined.txt ]; then \
+        echo "BUILD STOPPED — undefined name(s); this would be a 500 at runtime:"; \
+        sed "s/^/  /" /tmp/undefined.txt; \
+        exit 1; \
+    fi; \
+    rm -f /tmp/undefined.txt && pip uninstall -y -q pyflakes
+
 # The web app (Expo web export) — served at "/" so opening the server in a
 # browser gives the full JLTamp UI out of the box, talking to this same origin.
 COPY web ./web
