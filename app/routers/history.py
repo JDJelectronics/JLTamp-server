@@ -13,6 +13,7 @@ import time
 
 from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import select, func
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from ..db import SessionLocal
 from ..deps import require_user, accessible_library_ids
@@ -50,16 +51,30 @@ def _accessible(db, user: User, track_id: int) -> bool:
 
 
 def _state(db, user_id: int, track_id: int) -> UserTrackState:
-    st = db.execute(
-        select(UserTrackState).where(
-            UserTrackState.user_id == user_id, UserTrackState.track_id == track_id
-        )
-    ).scalar_one_or_none()
+    """Get-or-create the per-user state row for a track.
+
+    SELECT-then-INSERT would race: `/:/timeline` is a heartbeat that every client
+    sends every 10s, so a phone and a cast (or the web app) reporting the SAME
+    account on the SAME track both see "no row yet" and both insert. The loser
+    hit `UNIQUE constraint failed: user_track_state.user_id, .track_id` and the
+    whole heartbeat 500'd, losing that resume offset and play count.
+
+    So the INSERT is atomic instead: SQLite decides the winner, the loser is
+    ignored rather than raised, and both requests then read back the one row.
+    """
+    sel = select(UserTrackState).where(
+        UserTrackState.user_id == user_id, UserTrackState.track_id == track_id
+    )
+    st = db.execute(sel).scalar_one_or_none()
     if st is None:
-        st = UserTrackState(user_id=user_id, track_id=track_id, play_count=0,
-                            last_played_at=0, view_offset_ms=0)
-        db.add(st)
+        db.execute(
+            sqlite_insert(UserTrackState)
+            .values(user_id=user_id, track_id=track_id, play_count=0,
+                    last_played_at=0, view_offset_ms=0)
+            .on_conflict_do_nothing(index_elements=["user_id", "track_id"])
+        )
         db.flush()
+        st = db.execute(sel).scalar_one()
     return st
 
 

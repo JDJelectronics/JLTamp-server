@@ -138,6 +138,19 @@ def _apply_year(stmt, model, year: int | None, decade: int | None):
     return stmt
 
 
+def _int_param(raw, default=None):
+    """A paging parameter is whatever the caller typed — this is a Plex-compatible
+    API, so the caller is not always our own app. A bare int() on it turned any
+    non-numeric `X-Plex-Container-Start` into an unhandled ValueError, i.e. a 500
+    on a malformed request. Fall back to the default instead."""
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 def _page(db, stmt, start: int, size: int | None):
     if start:
         stmt = stmt.offset(start)
@@ -152,9 +165,14 @@ def section_all(request: Request, key: str, user: User = Depends(require_user),
                 type: int = 8, genre: str | None = None, limit: int | None = None,
                 sort: str | None = None, year: int | None = None,
                 decade: int | None = None, artist: str | None = None):
-    start = int(request.query_params.get("X-Plex-Container-Start", 0) or 0)
-    size = request.query_params.get("X-Plex-Container-Size")
-    size = int(size) if size is not None else (limit or None)
+    start = _int_param(request.query_params.get("X-Plex-Container-Start"), 0) or 0
+    size = _int_param(request.query_params.get("X-Plex-Container-Size"), limit or None)
+    # A negative start is meaningless — clamp it. A negative size used to reach
+    # SQLite as `LIMIT -1`, which it reads as "no limit", so keep that meaning:
+    # silently serving an EMPTY page would be a worse answer than the old one.
+    start = max(0, start)
+    if size is not None and size < 0:
+        size = limit or None
 
     db = SessionLocal()
     try:
