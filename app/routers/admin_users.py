@@ -329,14 +329,34 @@ def import_plex_likes(body: PlexImportBody, admin: User = Depends(require_admin)
             if tid:
                 matched.add(tid)
 
-        existing = {lt.track_id for lt in db.execute(
+        # Import into the "Liked Songs" PLAYLIST, because that is what the app
+        # renders. Writing only `liked_tracks` is why an earlier import landed
+        # invisibly and needed reconcile_liked_playlists.py afterwards — the rows
+        # were there, the user just never saw them. The table is still mirrored
+        # so it does not drift out of step with the playlist.
+        from .likes import liked_playlist
+
+        pl = liked_playlist(db, admin.id, create=True)
+        in_playlist = {r.track_id for r in db.execute(
+            select(PlaylistItem).where(PlaylistItem.playlist_id == pl.id)).scalars()}
+        in_table = {lt.track_id for lt in db.execute(
             select(LikedTrack).where(LikedTrack.user_id == admin.id)).scalars()}
+        pos = db.execute(
+            select(PlaylistItem.position).where(PlaylistItem.playlist_id == pl.id)
+            .order_by(PlaylistItem.position.desc())).scalars().first()
+        pos = (pos + 1) if pos is not None else 0
         now = int(time.time())
         added = 0
         for tid in matched:
-            if tid not in existing:
-                db.add(LikedTrack(user_id=admin.id, track_id=tid, created_at=now))
+            if tid not in in_playlist:
+                db.add(PlaylistItem(playlist_id=pl.id, track_id=tid, position=pos,
+                                    added_by=admin.id))
+                pos += 1
                 added += 1
+            if tid not in in_table:
+                db.add(LikedTrack(user_id=admin.id, track_id=tid, created_at=now))
+        if added:
+            pl.updated_at = now
         db.commit()
         return {"plexRated": len(liked), "matched": len(matched), "imported": added}
     finally:
