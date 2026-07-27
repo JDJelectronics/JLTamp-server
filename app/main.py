@@ -22,7 +22,7 @@ from . import config, backup
 from .db import init_db
 from .deps import require_admin, seed_admin
 from .scanner import scan_all, scan_state, request_stop
-from .routers import auth, media, stream, artwork, playlists, libraries, admin_users, likes, uploads, history, stats, mix, session, importer
+from .routers import auth, media, stream, artwork, playlists, libraries, admin_users, likes, uploads, history, stats, mix, session, importer, lyrics
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -74,7 +74,8 @@ app.add_middleware(
 for r in (auth.router, media.router, stream.router, artwork.router,
           playlists.router, libraries.router, admin_users.router, likes.router,
           uploads.router, history.router, stats.router, mix.router,
-          session.router, session.presence_router, importer.router):
+          session.router, session.presence_router, importer.router,
+          lyrics.router):
     app.include_router(r)
 
 

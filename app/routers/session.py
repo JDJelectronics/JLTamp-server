@@ -206,11 +206,21 @@ async def session_ws(websocket: WebSocket, code: str):
                 await _broadcast(s, {"t": "queue", "queue": s.queue})
                 continue
 
-            # Anyone may send an emoji reaction — echoed to everyone (incl. sender
-            # so their own reaction floats up too).
+            # Anyone may send a reaction — an emoji OR a short typed line —
+            # echoed to everyone including the sender, so their own message
+            # floats up too and they can see it went out.
+            #
+            # One channel rather than a second "chat" message type: guests and
+            # host already both have permission to use this one, and a typed
+            # line is the same thing as an emoji, only longer. The cap moved
+            # from 8 to 140 characters and newlines are collapsed, because this
+            # renders as a floating line over the player, not a chat log.
             if t == "reaction":
+                text = " ".join(str(msg.get("emoji", "")).split())[:140]
+                if not text:
+                    continue
                 await _broadcast(s, {
-                    "t": "reaction", "emoji": str(msg.get("emoji", ""))[:8],
+                    "t": "reaction", "emoji": text,
                     "userId": user.id, "name": name,
                 })
                 continue
