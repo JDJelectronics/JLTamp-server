@@ -1,26 +1,140 @@
-# JLTamp Server
+<p align="center">
+  <img src="docs/icon.png" alt="JLTamp" width="120">
+</p>
 
-**Self‑hosted music server — the backend for the JLTamp app.**
-Stream your own music library to the JLTamp mobile & web app, from a server you
-run yourself. Think *Plex / Jellyfin, but focused on music*. No ads, no
-tracking, no subscription — your library and your listening data stay on your
-own machine.
+<h1 align="center">JLTamp Server</h1>
+
+<p align="center">
+  <b>Self-hosted music server — the backend for the JLTamp app.</b><br>
+  Think <i>Plex / Jellyfin, but focused on music</i>.
+</p>
+
+<p align="center">
+  <a href="https://play.google.com/store/apps/details?id=com.jltamp.app">
+    <img alt="Get it on Google Play"
+         src="https://img.shields.io/badge/Google%20Play-JLTamp-00C896?logo=googleplay&logoColor=white&style=for-the-badge">
+  </a>
+  <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue?style=for-the-badge">
+  <img alt="Self-hosted" src="https://img.shields.io/badge/self--hosted-yes-6A5ACD?style=for-the-badge">
+  <img alt="Docker" src="https://img.shields.io/badge/docker-compose-2496ED?logo=docker&logoColor=white&style=for-the-badge">
+</p>
+
+---
+
+Stream your own music library to the JLTamp app or any browser, from a server you
+run yourself. No ads, no tracking, no subscription — your library and your
+listening data stay on your own machine.
 
 JLTamp does not provide, host, or distribute any music. It only plays media from
 **your** server, using **your own** files.
 
-<p align="left">
-  <a href="https://play.google.com/store/apps/details?id=com.jltamp.app">
-    <img alt="Get the Android app on Google Play"
-         src="https://img.shields.io/badge/Google%20Play-JLTamp-1DB954?logo=googleplay&logoColor=white&style=for-the-badge">
-  </a>
-  <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue?style=for-the-badge">
-  <img alt="Self-hosted" src="https://img.shields.io/badge/self--hosted-yes-6A5ACD?style=for-the-badge">
-</p>
+**Get the app:** [JLTamp on Google Play](https://play.google.com/store/apps/details?id=com.jltamp.app).
+Point it at your server and you're done. The web player is bundled with this
+repo, so a browser works without installing anything.
 
-> **Get the app:** [JLTamp on Google Play](https://play.google.com/store/apps/details?id=com.jltamp.app)
-> — point it at your own server and you're done. The web player is bundled with
-> this repo, so a browser works without installing anything.
+
+---
+
+## What you get
+
+JLTamp is two halves: **this server**, which owns your files and your data, and
+the **app**, which is the part you actually touch. Below is what each side does
+and how the pieces fit together.
+
+### Your library
+
+Point the server at a folder and it scans what's there — MP3, FLAC, ALAC, WAV,
+AAC, OGG and Opus. Libraries work like Plex's: add as many as you want, browse
+to the folder in the built-in file browser instead of typing paths, and rescan
+on demand. Rescans are incremental, so a library with tens of thousands of
+tracks doesn't get re-read from scratch every time.
+
+Album art and artist images are fetched from public music databases. Folders of
+loose singles get grouped into one collection per folder instead of littering
+your library with hundreds of one-track albums. **Your music is mounted
+read-only** — the server never writes to it.
+
+### Listening
+
+The player does the things you'd expect and a few you might not:
+
+- **Crossfade** between tracks, with adjustable length and five fade styles that
+  shift *when* the blend happens — from a long, lingering overlap to nearly
+  gapless. The fade runs natively, so it keeps going with the screen off.
+- **Volume normalisation**, so a quiet album doesn't disappear after a loud one.
+- **Gapless-feeling queue** with shuffle, repeat, and a queue you can reorder.
+- **Offline downloads** — take playlists or liked songs with you and play them
+  with no server in reach.
+- **Lyrics**, shown alongside the track.
+- **Quality selection**, so you can stream lighter on mobile data.
+
+### Listen Together
+
+Start a session, share it, and everyone hears the same thing at the same moment.
+The host controls playback; guests follow along. It's not "we both pressed play
+at once" — the server keeps positions in sync, and there's a per-device offset
+setting for when one speaker lags behind another.
+
+Everyone in the session can react with an emoji or a short typed line, which
+floats up over the player on everyone's screen. You can see who else is
+listening, and what they're listening to.
+
+### In the car
+
+Full **Android Auto** support: browse your libraries, playlists, liked songs and
+queue from the car screen, with a like button right in the car UI. Skip, pause
+and seek work from the steering wheel, a Bluetooth headset, a smartwatch or the
+lock screen — anything that speaks AVRCP.
+
+Music pauses when you leave the car and resumes when you get back in, and JLTamp
+publishes exactly one media session so you never get two players fighting over
+your lock screen.
+
+### Around the house
+
+- **Chromecast** — send playback to a TV or speaker; the app becomes the remote.
+- **Handoff** — start a track on your phone, pick it up on the web player or
+  another device from the same position.
+- **AirPlay route picker** on supported hardware.
+
+### Sharing and discovery
+
+- **Playlists**, including **shared playlists**: hand someone a share code and
+  they can join and add tracks. Every entry records who added it.
+- **Rebuild a playlist from a link** — paste one, and the server matches the
+  track list against files you already own.
+- **On this day** — what you were playing a year ago.
+- **Year in review** — your listening summed up, shareable.
+- **Stats** — top artists, tracks, and listening time.
+
+### DJ mode
+
+Two decks with a real crossfader. Load a track into A and B, play them
+independently, and blend by hand. Each deck is drawn as a spinning record that
+lights up while it plays. The main player pauses while you're in there and the
+decks are released when you leave.
+
+### The optional AI engine
+
+A separate, **also self-hosted** service (`ai/`) that you can skip entirely. When
+it's running it adds weekly playlists built from your own listening, genre
+inference for files with missing tags, and a radio mode that steers by tempo and
+mood. It talks to your server and nothing else — no listening data leaves your
+network, because there is nowhere else for it to go.
+
+### Accounts and access
+
+Multi-user and invite-based: you invite someone by email, they pick their own
+password. Every user gets their own likes, playlists and history. Admins manage
+users and libraries, and library access is per user — you decide who sees what.
+Passwords are hashed, each device gets its own token, and artwork is access-
+controlled so nobody can pull the cover of a playlist they're not part of.
+
+### Making it yours
+
+Accent colour (presets or a custom one), a choice of twelve animated
+backgrounds, an avatar, and the interface in your own language. The web player
+adapts to phones, tablets and desktop.
 
 ---
 
