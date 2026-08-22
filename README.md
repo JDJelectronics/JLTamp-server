@@ -9,6 +9,19 @@ own machine.
 JLTamp does not provide, host, or distribute any music. It only plays media from
 **your** server, using **your own** files.
 
+<p align="left">
+  <a href="https://play.google.com/store/apps/details?id=com.jltamp.app">
+    <img alt="Get the Android app on Google Play"
+         src="https://img.shields.io/badge/Google%20Play-JLTamp-1DB954?logo=googleplay&logoColor=white&style=for-the-badge">
+  </a>
+  <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue?style=for-the-badge">
+  <img alt="Self-hosted" src="https://img.shields.io/badge/self--hosted-yes-6A5ACD?style=for-the-badge">
+</p>
+
+> **Get the app:** [JLTamp on Google Play](https://play.google.com/store/apps/details?id=com.jltamp.app)
+> — point it at your own server and you're done. The web player is bundled with
+> this repo, so a browser works without installing anything.
+
 ---
 
 ## Features
