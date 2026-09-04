@@ -279,7 +279,7 @@ def get_lyrics(track_id: str, user: User = Depends(require_user)):
         if not t:
             raise HTTPException(404, "No such track")
 
-        # The INDEX first. It already holds the answer for 41k tracks — the
+        # The INDEX first. It already holds the answer for most tracks — the
         # local text and, since the online pass, what LRCLIB had. Re-deriving it
         # here was not just wasteful: this path asks with artist_name, which is
         # the album artist ("Various Artists" on any compilation), while the
@@ -450,8 +450,8 @@ def lyrics_index_start(force: bool = False, online: bool = False,
     costs seconds; `force=true` re-reads everything anyway.
 
     `online=true` adds a second pass that asks LRCLIB about every track still
-    without lyrics and indexes what it finds. Hours, not seconds: 63k unique
-    songs at a few requests a second. Needs JLTAMP_LYRICS_ONLINE on, and only
+    without lyrics and indexes what it finds. Hours, not seconds: one request per
+    unique song, a few per second. Needs JLTAMP_LYRICS_ONLINE on, and only
     artist + title ever leave this server.
     """
     from .. import lyrics_index

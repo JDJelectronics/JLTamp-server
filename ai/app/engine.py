@@ -181,9 +181,10 @@ class Engine:
         """How many tracks in the library actually have a tempo.
 
         Not the same as the size of the features file, which also holds
-        measurements for tracks that have since left the library: that file had
-        69,467 entries against 63,102 tracks that could really be put on a
-        tempo curve, and reporting the bigger number hid a third of the gap.
+        measurements for tracks that have since left the library: on a real
+        library that file held far more entries than there were tracks that
+        could be put on a tempo curve, and reporting the bigger number hid a
+        third of the gap.
         """
         self._measured = sum(1 for t in self.library.snapshot()
                              if t.features.get("bpm"))
@@ -390,7 +391,7 @@ class Engine:
         low = prompt.lower()
         tracks = self.library.snapshot()
         if not tracks:
-            # Reading 69k tracks and backfilling genres takes a few minutes, so
+            # Reading a whole library and backfilling genres takes minutes, so
             # this is the normal state right after a restart — not a failure.
             # Say which it is, because "no tracks" reads like the library is
             # empty when it is merely still loading.

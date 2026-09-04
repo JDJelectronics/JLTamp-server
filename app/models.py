@@ -286,8 +286,8 @@ class TrackLyrics(Base):
 
     Display already works without this: /lyrics/{id} reads the sidecar or the
     embedded tag per track, on demand. But "which song has this line in it"
-    cannot be answered one file at a time — 78k tag reads over NFS per query is
-    not a search, so the text has to sit in the database.
+    cannot be answered one file at a time — a tag read per track over NFS, every
+    query, is not a search, so the text has to sit in the database.
 
     Only LOCAL sources are indexed (`.lrc`/`.txt` next to the file, or the
     embedded tag). Anything fetched online is displayed but never written here:

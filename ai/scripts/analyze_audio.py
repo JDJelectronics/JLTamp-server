@@ -174,7 +174,7 @@ def main() -> int:
         except (json.JSONDecodeError, OSError):
             continue
     # Entries from a previous run that produced nothing are worth retrying:
-    # the old Plex-era cache is 31k tracks of empty dicts.
+    # the old Plex-era cache was full of empty dicts.
     cache = {k: v for k, v in cache.items() if isinstance(v, dict) and v.get("bpm")}
     print(f"📂 {len(cache)} tracks already measured → {out_file}")
 

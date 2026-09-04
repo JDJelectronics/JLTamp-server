@@ -1,7 +1,7 @@
 """Shared, cached library snapshot for the benchmarks.
 
-Every measurement paid four minutes of startup — two to fetch 69k tracks, two
-more for the genre backfill — before it could score a single prompt. At that
+Every measurement paid minutes of startup — fetching the whole library, then the
+genre backfill — before it could score a single prompt. At that
 price a hunch does not get checked, and today's wrong diagnoses all came from
 not checking. Cached, a run costs seconds.
 

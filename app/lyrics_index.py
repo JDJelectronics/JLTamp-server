@@ -2,8 +2,8 @@
 
 Displaying lyrics and searching them are different problems. Display reads one
 file when you open one track — cheap, and that is what routers/lyrics.py does.
-Search has to look at everything at once, and on this library that is 78k tag
-reads over NFS: minutes per query, on a read-only mount, for one search box.
+Search has to look at everything at once, which means a tag read per track over
+NFS: minutes per query, on a read-only mount, for one search box.
 So the local text is copied into the database once and queried from there.
 
 Local sources first — `.lrc`/`.txt` sidecars and embedded tags. Those are free
@@ -16,7 +16,7 @@ asked for that on 2026-08-01, knowing it makes part of the index a copy of
 LRCLIB's.
 
 Being a guest on someone else's free service is the whole design of that pass:
-requests are deduplicated by artist+title (63k unique pairs behind 74k tracks),
+requests are deduplicated by artist+title (many tracks share a pair),
 throttled to a few per second, backed off on errors, and every answer including
 a miss is written down so a re-run never asks twice.
 
@@ -145,8 +145,8 @@ def _artist_of(track: Track) -> str:
 def _online_pass(db) -> None:
     """Ask LRCLIB about every track that has no lyrics yet.
 
-    Deduplicated by normalised artist+title, so the 74k tracks behind 63k unique
-    songs cost 63k requests and not 74k, and a compilation that repeats a song
+    Deduplicated by normalised artist+title, so a library costs one request per
+    unique song rather than one per track, and a compilation that repeats a song
     ten times costs one. Every answer is written down, misses included, so a
     second run picks up where this one stopped instead of asking again.
     """

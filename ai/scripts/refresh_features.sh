@@ -4,8 +4,8 @@
 #
 # analyze_audio.py is already incremental — it skips every track it has a
 # measurement for — so this is just the scheduled wrapper around it. Without a
-# schedule the gap only grows: of 74,950 tracks in the library, 63,102 had a
-# measured tempo, and the ~11,800 without one can never appear in a wind-down
+# schedule the gap only grows: on a large library a sizeable share of tracks
+# has no measured tempo, and those can never appear in a wind-down
 # (no tempo, no curve) nor earn an audio boost for "gym" or "slapen".
 #
 # The engine notices the new file by itself (it re-reads it when the mtime
@@ -18,7 +18,7 @@
 #
 #   Streaming over the API (~2.9 s/track) — works anywhere, including the
 #   Jetson, at the cost of downloading each track. Set AUDIO_ALLOW_STREAM=1.
-#   The first run has a backlog to clear (~9 h for 11,800 tracks); every run
+#   The first run has a backlog to clear (hours, on a large library); every run
 #   after that only sees newly added music and finishes in minutes.
 #
 # Cron example — nightly at 03:00, before the weekly playlists at 04:00:
