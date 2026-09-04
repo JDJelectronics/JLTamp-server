@@ -118,12 +118,12 @@ JOB_TIMEOUT_SEC = _env_int("AI_JOB_TIMEOUT_SEC", 120)
 # who has barely listened gets no "personal" playlist rather than a random one.
 # Both must be met: enough of an account history, and enough listening in it.
 #
-# The default is the month the rule describes. It used to be 0, which turned
-# the account-age half of that rule off entirely while engine.py went on
-# explaining why it was there — so a day-old account got a "personal" mix built
-# from whatever it happened to have played. Set AI_MIN_ACCOUNT_AGE_DAYS=0 to
-# deliberately switch it off (handy on a single-user install).
-MIN_ACCOUNT_AGE_SEC = _env_int("AI_MIN_ACCOUNT_AGE_DAYS", 30) * 86400
+# The rule describes a month, and a hosted install with several users wants that:
+# without it a day-old account gets a "personal" mix built from whatever it
+# happened to have played. Here the default is 0 — off — because a self-hosted
+# server is usually one person who wants their playlist on day one, not in a
+# month. Set AI_MIN_ACCOUNT_AGE_DAYS=30 once more people share the server.
+MIN_ACCOUNT_AGE_SEC = _env_int("AI_MIN_ACCOUNT_AGE_DAYS", 0) * 86400
 MIN_TASTE_SEED = _env_int("AI_MIN_TASTE_SEED", 25)
 # Hoeveel het persoonlijke smaakprofiel in ELKE semantische aanbeveling meeweegt
 # (Spotify-stijl). 0 = uit; ~0.25 = subtiel persoonlijk, de prompt blijft
