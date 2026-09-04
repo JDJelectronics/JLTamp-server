@@ -65,8 +65,13 @@ The player does the things you'd expect and a few you might not:
 - **Gapless-feeling queue** with shuffle, repeat, and a queue you can reorder.
 - **Offline downloads** — take playlists or liked songs with you and play them
   with no server in reach.
-- **Lyrics**, shown alongside the track.
+- **Lyrics**, shown alongside the track and searchable — read from `.lrc`/`.txt`
+  files and tags in your own music. An online lookup can fill the gaps, but it is
+  off until you switch it on yourself.
 - **Quality selection**, so you can stream lighter on mobile data.
+- **Smart playlists** built from what this server already knows — recently added,
+  forgotten favourites, on repeat. Plain database rules over your own play
+  history and likes; no AI and no second machine involved.
 
 ### Listen Together
 
@@ -78,6 +83,9 @@ setting for when one speaker lags behind another.
 Everyone in the session can react with an emoji or a short typed line, which
 floats up over the player on everyone's screen. You can see who else is
 listening, and what they're listening to.
+
+The host can hand the session to someone else without ending it, and a track
+someone queues shows who added it for as long as it is still waiting.
 
 ### In the car
 

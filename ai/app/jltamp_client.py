@@ -9,6 +9,7 @@ Supply `JLTAMP_TOKEN`, or an email/password pair that we exchange for one.
 """
 from __future__ import annotations
 
+import os
 import re
 import threading
 import time
@@ -98,7 +99,37 @@ class Track:
         if (self.album and not compilation
                 and self.album.lower() not in (self.title or "").lower()):
             bits.append(self.album)
+        # Optioneel: verrijk met MEETBARE beschrijvers (geen giswerk) — tempo/
+        # energie uit de audio-analyse + het decennium uit het jaar, voor beter
+        # vibe-/era-zoeken. Uit tenzij AI_RICH_TEXT=1; aanzetten verandert ALLE
+        # embeddings, dus vereist een bewuste re-embed (~14 min).
+        if os.environ.get("AI_RICH_TEXT", "").lower() in ("1", "true", "yes"):
+            bits.extend(self._descriptors())
         return " - ".join(b for b in bits if b)
+
+    def _descriptors(self) -> list[str]:
+        """Meetbare stijl-woorden: decennium + tempo/energie (indien geanalyseerd).
+        Alleen echte, gemeten data — nooit giswerk (dat corrumpeert de vector)."""
+        out: list[str] = []
+        if self.year:
+            out.append(f"{(self.year // 10) * 10}s")
+        bpm = self.features.get("bpm")
+        if bpm:
+            if bpm < 70:
+                out.append("langzaam slow")
+            elif bpm < 100:
+                out.append("midtempo relaxed")
+            elif bpm < 132:
+                out.append("upbeat energiek")
+            else:
+                out.append("snel uptempo driving")
+        energy = self.features.get("energy")
+        if isinstance(energy, (int, float)):
+            if energy < 0.15:
+                out.append("rustig kalm mellow")
+            elif energy > 0.38:
+                out.append("energiek krachtig")
+        return out
 
     @property
     def match_genre(self) -> str:
@@ -425,9 +456,13 @@ class JLTampClient:
             raise JLTampError("refusing to create an empty playlist")
 
         with self._lock:
+            # Build the new one FIRST, then drop the old. The other order — the
+            # one this used to do — has a window where the old playlist is gone
+            # and the new one does not exist yet, so a network hiccup or a
+            # server restart in between destroys a list the user had. JLTamp
+            # allows two playlists with the same title (there are already two
+            # "My Top Songs 2026" in this library), so the overlap is harmless.
             existing = self.find_playlist(title)
-            if existing:
-                self.delete_playlist(existing)
 
             head, tail = tracks[:50], tracks[50:]
             uri = self._uri([t.rating_key for t in head])
@@ -442,13 +477,24 @@ class JLTampClient:
                 raise JLTampError("playlist create returned no ratingKey")
             rk = str(meta[0].get("ratingKey"))
 
+            # Every chunk is checked. Unchecked, a rejected PUT left a playlist
+            # that is simply short, with nothing anywhere saying so.
             for i in range(0, len(tail), 50):
                 chunk = tail[i:i + 50]
-                self.session.put(
+                resp = self.session.put(
                     f"{self.url}/playlists/{rk}/items", headers=self._headers(),
                     params={"uri": self._uri([t.rating_key for t in chunk])},
                     timeout=60,
                 )
+                resp.raise_for_status()
+
+            if existing and existing != rk:
+                try:
+                    self.delete_playlist(existing)
+                except requests.RequestException as e:
+                    # The new list is in place; a leftover duplicate is far
+                    # less bad than losing the old one, so say it and move on.
+                    print(f"⚠️  could not remove the previous '{title}': {e}")
             return rk
 
     @staticmethod

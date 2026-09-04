@@ -193,6 +193,11 @@ async def session_ws(websocket: WebSocket, code: str):
                 continue
             t = msg.get("t")
 
+            # Recomputed every message, never trusted from connect time: after a
+            # promotion or a handover the old flag lies, and it is what gates
+            # transport authority.
+            is_host = user.id == s.host_user_id
+
             # Clock sync — reply immediately with server time.
             if t == "ping":
                 await websocket.send_text(json.dumps(
@@ -202,7 +207,13 @@ async def session_ws(websocket: WebSocket, code: str):
 
             # Anyone may add to the shared queue.
             if t == "queueAdd" and msg.get("track") is not None:
-                s.queue.append(msg["track"])
+                track = msg["track"]
+                # Stamp who added it. The clients show this for as long as the
+                # track is still queued, so "<name> added X" stays on screen
+                # until it actually plays instead of flashing past in a toast.
+                if isinstance(track, dict):
+                    track = {**track, "addedBy": name, "addedById": user.id}
+                s.queue.append(track)
                 await _broadcast(s, {"t": "queue", "queue": s.queue})
                 continue
 
@@ -215,6 +226,28 @@ async def session_ws(websocket: WebSocket, code: str):
             # line is the same thing as an emoji, only longer. The cap moved
             # from 8 to 140 characters and newlines are collapsed, because this
             # renders as a floating line over the player, not a chat log.
+            # The host may hand the session to someone else. Same broadcast the
+            # disconnect-promotion path uses, so clients need no new handling:
+            # whoever becomes host republishes their track and everyone
+            # re-anchors to it.
+            if t == "makeHost":
+                if not is_host:
+                    continue
+                try:
+                    target = int(msg.get("userId") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if target == s.host_user_id or target not in s.participants:
+                    continue
+                for q in s.participants.values():
+                    q.is_host = (q.user_id == target)
+                s.host_user_id = target
+                await _broadcast(s, {
+                    "t": "host", "hostUserId": target,
+                    "participants": _participants_payload(s),
+                })
+                continue
+
             if t == "reaction":
                 text = " ".join(str(msg.get("emoji", "")).split())[:140]
                 if not text:

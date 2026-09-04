@@ -127,6 +127,15 @@ class EmbedClient:
         return vecs
 
     def embed_one(self, text: str) -> np.ndarray:
+        """Embed one search prompt.
+
+        Only the prompt passes through here; the library goes through
+        `embed_batched`. Dat onderscheid is precies waarom het voorvoegsel hier
+        staat en niet in `embed`: bij een instructiemodel hoort de instructie
+        aan de zoekopdracht, niet aan de nummers waarin gezocht wordt.
+        """
+        if config.EMBED_QUERY_PREFIX:
+            text = config.EMBED_QUERY_PREFIX + text
         vecs = self.embed([text])
         if not vecs:
             raise EmbedError("no vector returned")

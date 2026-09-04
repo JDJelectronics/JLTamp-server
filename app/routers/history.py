@@ -17,9 +17,9 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from ..db import SessionLocal
 from ..deps import require_user, accessible_library_ids
-from ..ids import parse_key
+from ..ids import parse_key, track_key
 from ..models import Track, Album, User, UserTrackState, PlayEvent
-from ..serializers import track_dict, album_dict, container
+from ..serializers import track_dict, album_dict, container, user_thumb_ref, art_ref
 
 router = APIRouter()
 
@@ -86,11 +86,44 @@ SESSION_TTL = 90  # a client heartbeats every 10s; 90s without one = gone
 _SESSIONS: dict[tuple[int, str], dict] = {}
 
 
+# Hoe lang een "playing" zonder voortgang nog geloofd wordt. Ruim boven een
+# bufferhikje, ruim onder SESSION_TTL, zodat een vastgelopen client vanzelf
+# uit /status/presence valt in plaats van er dagen te blijven staan.
+STALL_GRACE = 25
+
+
+# Per sessie: (positie, wanneer die positie voor het laatst veranderde).
+# Overleeft het verlopen van de sessie zelf — zie de uitleg in _touch_session.
+_LAST_MOVE: dict[tuple[int, str], tuple[int, float]] = {}
+
+
 def _touch_session(user: User, session_id: str, track_id: int, state: str,
                    offset_ms: int, device: str) -> None:
     key = (user.id, session_id or "default")
     if state == "stopped":
         _SESSIONS.pop(key, None)
+        _LAST_MOVE.pop(key, None)
+        return
+
+    # Een client die "playing" roept terwijl de positie niet opschuift, speelt
+    # niet. Dat is geen theorie: een JLTamp-tabblad op de achtergrond wordt door
+    # de browser afgeknepen tot één timertik per minuut en blijft dan "playing"
+    # met een bevroren positie sturen. Gemeten op 2026-08-06: twee hartslagen,
+    # 62 seconden uit elkaar, allebei time=151737 — en de eigenaar stond
+    # daardoor twee dagen lang bij iedereen in beeld als luisteraar, mét het
+    # nummer waar hij toen op stond.
+    #
+    # We laten zo'n hartslag de sessie niet verversen. Hij verdwijnt dan vanzelf
+    # via SESSION_TTL, en komt meteen terug zodra de positie wél beweegt.
+    # De laatst BEWOGEN positie wordt apart bijgehouden, niet in _SESSIONS.
+    # Dat is het hele punt: een vastgelopen sessie valt na SESSION_TTL weg, en
+    # dan zou de volgende bevroren hartslag hem doodleuk opnieuw aanmaken —
+    # je knippert dan in en uit beeld in plaats van te verdwijnen.
+    now = time.time()
+    last = _LAST_MOVE.get(key)
+    if last is None or abs(offset_ms - last[0]) >= 1000:
+        _LAST_MOVE[key] = (offset_ms, now)
+    elif state == "playing" and now - last[1] > STALL_GRACE:
         return
     _SESSIONS[key] = {
         "user_id": user.id,
@@ -154,6 +187,11 @@ def _live_sessions() -> list[dict]:
     for key, s in list(_SESSIONS.items()):
         if now - s["updated_at"] > SESSION_TTL:
             del _SESSIONS[key]
+    # Een client die uren geleden voor het laatst bewoog hoeven we niet meer te
+    # onthouden; komt hij terug, dan telt hij gewoon weer als nieuw.
+    for key, (_pos, seen) in list(_LAST_MOVE.items()):
+        if now - seen > 3600 and key not in _SESSIONS:
+            del _LAST_MOVE[key]
     return list(_SESSIONS.values())
 
 
@@ -235,6 +273,75 @@ def sessions(user: User = Depends(require_user)):
         db.close()
 
 
+@router.get("/status/presence")
+def presence(user: User = Depends(require_user)):
+    """Who is listening right now — and deliberately NOT to what.
+
+    /status/sessions is the server dashboard: it carries the track, and a
+    normal user only ever sees their own devices there. This is the opposite
+    trade: everyone may see everyone, because all it says is that a person has
+    music on. What they are playing is theirs.
+
+    That restraint is the feature. A house where you can see the lights are on
+    is friendly; one where the neighbours read your playlist is not.
+    """
+    live = _live_sessions()
+    if not live:
+        return {"listeners": []}
+
+    db = SessionLocal()
+    try:
+        people = {u.id: u for u in db.execute(select(User)).scalars()}
+        seen: dict[int, dict] = {}
+        for s in live:
+            u = people.get(s["user_id"])
+            if not u:
+                continue
+
+            share = (u.share_activity or "presence")
+            mine = u.id == user.id
+            # "none" means invisible to everyone else. You still see yourself,
+            # so the setting never leaves you wondering whether it took.
+            if share == "none" and not mine:
+                continue
+
+            # One entry per person, not per device: two phones is still one
+            # listener, and "playing" beats "paused" if they differ.
+            row = seen.get(u.id)
+            if row and row["state"] == "playing":
+                continue
+
+            entry = {
+                "userId": u.id,
+                "name": u.display_name or u.email,
+                "thumb": user_thumb_ref(u),
+                "state": s["state"],
+                "isMe": mine,
+                "share": share,
+            }
+            # The track rides along ONLY for someone who chose "track" — not
+            # even for yourself. Your own entry is filtered out by the UI
+            # anyway, so sending it would widen the payload for nothing and
+            # weaken the one rule worth stating plainly: nothing in this
+            # response says what a person is playing unless they asked for it.
+            if share == "track":
+                track = db.get(Track, s["track_id"])
+                if track:
+                    entry["title"] = track.title
+                    entry["artist"] = track.orig_artist or track.artist_name
+                    entry["album"] = track.album_title
+                    # The sleeve, so tapping a face shows a record and not a
+                    # line of text. Same art route as everywhere else.
+                    entry["thumb_track"] = art_ref(track_key(track.id))
+                    entry["ratingKey"] = track_key(track.id)
+            seen[u.id] = entry
+        # Yourself first, then whoever is actually playing.
+        out = sorted(seen.values(), key=lambda r: (not r["isMe"], r["state"] != "playing", r["name"].lower()))
+        return {"listeners": out}
+    finally:
+        db.close()
+
+
 # ── on deck / continue listening ─────────────────────────────────────────────
 # Plex's On Deck: what you were in the middle of. A track counts as "in progress"
 # once you are past the intro and not yet at the outro — otherwise every track
@@ -267,6 +374,92 @@ def on_deck(user: User = Depends(require_user), limit: int = 20):
     try:
         return container([track_dict(t, state=st)
                           for t, st in _on_deck_rows(db, user, limit)])
+    finally:
+        db.close()
+
+
+# ── handoff: pick up where another device left off ───────────────────────────
+# On Deck answers "what was I in the middle of". This answers the narrower and
+# more useful question a client asks when it opens: "was I *just* listening
+# somewhere else?" — the walk from the car to the couch. It is deliberately not
+# On Deck's list: a handoff is one track, from one other device, recent enough
+# that the listener still remembers where they were.
+
+# Older than this and it is no longer a handoff, it is just history — On Deck
+# already covers that, and offering to resume this morning's track at bedtime is
+# noise. Four hours covers a commute, a shopping trip and a long walk.
+HANDOFF_MAX_AGE_S = 4 * 3600
+
+
+def _requesting_device(request: Request) -> str:
+    return (request.headers.get("X-Plex-Device-Name")
+            or request.headers.get("X-Plex-Platform")
+            or request.headers.get("X-Plex-Product") or "")
+
+
+@router.get("/player/handoff")
+def handoff(request: Request, user: User = Depends(require_user)):
+    """The track this listener was playing on a DIFFERENT device just now, with
+    the offset to resume at. Returns {"handoff": null} when there is nothing to
+    offer, which is the common case — clients call this on every foreground."""
+    here = _requesting_device(request)
+    now = int(time.time())
+
+    db = SessionLocal()
+    try:
+        # Walk back through recent plays rather than taking only the last row:
+        # the newest event is often this very device (it heartbeats on open),
+        # and a paused-then-resumed track can leave a short trailing row. A
+        # handful of rows is enough to find the last *other* device.
+        rows = db.execute(
+            select(PlayEvent)
+            .where(PlayEvent.user_id == user.id,
+                   PlayEvent.ended_at >= now - HANDOFF_MAX_AGE_S)
+            .order_by(PlayEvent.ended_at.desc())
+            .limit(10)
+        ).scalars().all()
+
+        allowed = accessible_library_ids(db, user)
+        for ev in rows:
+            # Same device → there is nothing to hand over; it already knows.
+            if here and ev.device and ev.device == here:
+                continue
+            # A live session elsewhere is not a handoff — the other device is
+            # still playing it, and offering to steal it mid-track is worse than
+            # saying nothing. Listen Together is the feature for that.
+            if any(s["track_id"] == ev.track_id and s["state"] == "playing"
+                   and s["device"] != here for s in _live_sessions()):
+                continue
+
+            track = db.get(Track, ev.track_id)
+            if not track:
+                continue
+            if allowed is not None and track.library_id not in allowed:
+                continue
+
+            st = db.execute(
+                select(UserTrackState).where(UserTrackState.user_id == user.id,
+                                             UserTrackState.track_id == track.id)
+            ).scalar_one_or_none()
+            offset = int(st.view_offset_ms) if st else 0
+            total = track.duration_ms or ev.duration_ms or 0
+
+            # Same window On Deck uses: past the intro, short of the outro.
+            # Outside it there is no meaningful point to resume at.
+            if offset <= ONDECK_MIN_MS:
+                continue
+            if total and offset >= total * ONDECK_MAX_FRACTION:
+                continue
+
+            return {"handoff": {
+                **track_dict(track, state=st),
+                "offsetMs": offset,
+                "device": ev.device or "",
+                "endedAt": int(ev.ended_at),
+                "agoSec": max(0, now - int(ev.ended_at)),
+            }}
+
+        return {"handoff": None}
     finally:
         db.close()
 

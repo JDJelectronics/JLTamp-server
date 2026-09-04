@@ -99,6 +99,41 @@ GENERIC_MUSIC_WORDS = {
 }
 
 
+class Signals:
+    """Whose likes and skips to score with.
+
+    These used to be written onto the Track objects themselves, but
+    `Library.snapshot()` hands every caller the *same* list of the *same*
+    objects. With one thread per job, two people asking at once scored each
+    other's playlists, and because the values stayed behind until the next
+    library refresh, a request without a token inherited whoever asked last.
+
+    So the per-user history lives here and is passed down instead. With no
+    arguments it falls back to what the library refresh put on the track — the
+    service account's history, which is the right answer when nobody is
+    identified.
+    """
+    __slots__ = ("_likes", "_skips")
+
+    def __init__(self, likes: set | None = None, skips: dict | None = None):
+        self._likes = likes
+        self._skips = skips
+
+    def liked(self, track: Track) -> bool:
+        if self._likes is None:
+            return track.liked
+        return track.rating_key in self._likes
+
+    def skips(self, track: Track) -> int:
+        if self._skips is None:
+            return track.skips
+        return self._skips.get(track.rating_key, 0)
+
+
+# The library's own signals: whatever `Library.refresh()` put on the tracks.
+LIBRARY_SIGNALS = Signals()
+
+
 def expand_query(prompt: str) -> str:
     """Give a very short prompt enough context to embed meaningfully.
 
@@ -159,8 +194,27 @@ def extract_year(prompt: str) -> int | None:
     return int(m.group(0)) if m else None
 
 
+# "niks te hard", "niet te snel", "geen harde" — the word right after says what
+# is NOT wanted, so the context it names must not be switched on.
+_NEGATED = re.compile(r"\b(?:niet|niks|nooit|geen|no|not)\s+(?:te\s+|zo\s+|too\s+)?(\w+)")
+
+
+def negated_words(prompt: str) -> set[str]:
+    return {m.group(1) for m in _NEGATED.finditer(prompt)}
+
+
 def active_contexts(prompt: str) -> list[str]:
-    return [key for key in CONTEXT_MAPPER if key in prompt]
+    """The context keys a prompt asks for — minus the ones it asks against.
+
+    "niks te hard, mijn moeder is er" used to return a hardstyle playlist: the
+    word "hard" switched on a context wanting 130-200 BPM, and nothing looked
+    at the "niks te" in front of it. A prompt that says what it does not want
+    is not a request for exactly that.
+    """
+    negated = negated_words(prompt)
+    return [key for key in CONTEXT_MAPPER
+            if key in prompt
+            and not any(n == key or n.startswith(key) for n in negated)]
 
 
 def context_tags(contexts: list[str]) -> set[str]:
@@ -171,6 +225,15 @@ def context_tags(contexts: list[str]) -> set[str]:
     return tags
 
 
+# Words that follow "niet"/"geen" in ordinary speech without naming anything to
+# leave out. "niet meer", "niet echt", "niet zo" — grammar, not a filter.
+_NOT_AN_EXCLUSION = {
+    "meer", "echt", "zo", "dan", "heel", "erg", "veel", "alleen", "altijd",
+    "vaak", "steeds", "weer", "eens", "even", "helemaal", "zoveel", "teveel",
+    "much", "really", "very", "too", "more", "just", "only",
+} | GENERIC_MUSIC_WORDS
+
+
 def exclusions(prompt: str) -> list[str]:
     """Words the user asked to leave out: "feest zonder metal" -> ["metal"].
 
@@ -179,13 +242,106 @@ def exclusions(prompt: str) -> list[str]:
     "muziek" — and every track whose metadata mentioned it was dropped before
     scoring. That silently removed the correct answers from any prompt
     containing a word ending in "no", "geen" or "niet".
+
+    The same failure has a second door. An exclusion is matched as a substring
+    against the track's metadata, so a short everyday word does enormous
+    damage: "iets waar ik niet bij na hoef te denken" excluded "bij", which
+    knocked out every track whose text contains those three letters anywhere.
+    Hence the length floor and the stop list — a real exclusion names a genre,
+    an artist or a mood, and those are not three letters long and not "meer".
     """
-    return re.findall(
+    found = re.findall(
         r"\b(?:zonder|geen|niet|no|exclude|behalve)\s+(\w+)", prompt)
+    return [w for w in found
+            if len(w) >= 4 and w.lower() not in _NOT_AN_EXCLUSION]
+
+
+def _walk_targets(graded: list[tuple[Track, float]], targets: list[float],
+                  per_artist: int, monotone: str = "",
+                  tolerance: float = 2.0) -> list[Track]:
+    """Take the track closest to each target tempo in turn, without repeats.
+
+    `monotone` is "down", "up" or "" — a curve that is supposed to keep
+    descending (or climbing) may not turn around when the material near the
+    target runs out, so the direction is enforced with a running limit rather
+    than hoped for. See descending_tempo_curve for what that prevents.
+    """
+    pool = list(graded)
+    used: dict[str, int] = {}
+    curve: list[Track] = []
+    limit = None
+    for target in targets:
+        order = sorted(range(len(pool)), key=lambda k: abs(pool[k][1] - target))
+        if limit is not None:
+            order = [k for k in order
+                     if (pool[k][1] <= limit if monotone == "down"
+                         else pool[k][1] >= limit)]
+        if not order:
+            break                     # nothing left in the right direction
+        pick = next((k for k in order
+                     if used.get(pool[k][0].real_artist.lower(), 0) < per_artist),
+                    order[0])
+        t, bpm = pool.pop(pick)
+        if monotone:
+            # Track the running extreme, not just the last pick: a per-step
+            # tolerance that resets would let the curve creep back the other
+            # way 2 BPM at a time, which over fifty tracks is no curve at all.
+            head = bpm + tolerance if monotone == "down" else bpm - tolerance
+            limit = head if limit is None else (
+                min(limit, head) if monotone == "down" else max(limit, head))
+        used[t.real_artist.lower()] = used.get(t.real_artist.lower(), 0) + 1
+        curve.append(t)
+    return curve
+
+
+def _spread(graded: list[tuple[Track, float]], low_pct: float,
+            high_pct: float) -> tuple[float, float]:
+    """The tempo range to shape a curve over, as percentiles of the pool.
+
+    Percentiles rather than fixed numbers: a library that skews slow should
+    still get a full curve, just over a lower range.
+    """
+    bpms = sorted(b for _, b in graded)
+    hi = bpms[min(len(bpms) - 1, int(len(bpms) * high_pct))]
+    lo = bpms[max(0, int(len(bpms) * low_pct))]
+    if hi <= lo:                      # too little spread to shape a curve
+        hi, lo = bpms[-1], bpms[0]
+    return lo, hi
+
+
+# The shape of a tempo journey: x runs 0..1 across the playlist, the result is
+# where the tempo should sit between the pool's slow and fast end.
+ARC_SHAPES = {
+    # Warming up: from calm to fast, and it never dips back.
+    "up": lambda x: x,
+    # A party: climbs to a peak halfway and comes back down. A triangle, not a
+    # sine — a sine flattens near the top and parks six tracks on the peak.
+    "peak": lambda x: 1.0 - abs(2.0 * x - 1.0),
+}
+
+
+def tempo_arc(graded: list[tuple[Track, float]], count: int, shape: str,
+              per_artist: int = 2) -> list[Track]:
+    """A playlist whose tempo follows `shape` from start to finish.
+
+    The wind-down proved the idea: tempo is measured, so a curve built on it
+    actually sounds like a curve. This is the same machinery with the
+    direction opened up — see ARC_SHAPES.
+    """
+    if not graded or shape not in ARC_SHAPES:
+        return []
+    lo, hi = _spread(graded, 0.05, 0.95)
+    n = min(count, len(graded))
+    curve = ARC_SHAPES[shape]
+    targets = [lo + (hi - lo) * curve(i / max(1, n - 1)) for i in range(n)]
+    # Only a one-way climb can be held to a direction; a peak goes both ways.
+    return _walk_targets(graded, targets, per_artist,
+                         monotone="up" if shape == "up" else "")
 
 
 def descending_tempo_curve(graded: list[tuple[Track, float]],
-                           count: int, per_artist: int = 3) -> list[Track]:
+                           count: int, per_artist: int = 3,
+                           tolerance: float = 2.0) -> list[Track]:
     """Order tracks into a smooth downward tempo ramp.
 
     `graded` is (track, bpm) pairs; every track must carry a measured tempo,
@@ -203,28 +359,109 @@ def descending_tempo_curve(graded: list[tuple[Track, float]],
     (a sleep-music label with hundreds of near-identical ambient tracks, say)
     would otherwise fill the whole curve by itself. When every remaining artist
     is capped we still take the closest track rather than leave a gap.
+
+    A pick may never be faster than what came before it (bar `tolerance`, so a
+    plateau is allowed). Without that rule the curve only descends while there
+    is material near the target: a real pool is lumpy — someone's favourites
+    are upbeat, their sleep music is slow, and between 60 and 90 BPM there is
+    almost nothing — so once the slow tracks ran out, "closest to the target"
+    started returning fast ones and the wind-down climbed from 27 BPM back to
+    117. Running short is the honest answer there; publishing a ramp that goes
+    the wrong way is not, and _publish() already explains a short playlist.
     """
     if not graded:
         return []
-    bpms = sorted(b for _, b in graded)
-    hi = bpms[min(len(bpms) - 1, int(len(bpms) * 0.75))]
-    lo = bpms[max(0, int(len(bpms) * 0.10))]
-    if hi <= lo:                      # too little spread to shape a curve
-        hi, lo = bpms[-1], bpms[0]
+    lo, hi = _spread(graded, 0.10, 0.75)
     n = min(count, len(graded))
-    pool = list(graded)
-    curve: list[Track] = []
+    targets = [hi - (hi - lo) * (i / max(1, n - 1)) for i in range(n)]
+    return _walk_targets(graded, targets, per_artist, monotone="down",
+                         tolerance=tolerance)
+
+
+# Total, hard block, easy block — in seconds. A 30-minute session of 4 on,
+# 2 off is a common shape and a sane thing to get when the prompt says only
+# "intervaltraining".
+INTERVAL_DEFAULTS = (30 * 60, 4 * 60, 2 * 60)
+
+_MINUTES = re.compile(r"(\d{1,3})\s*(?:minuten|minuut|min)\b")
+_HARD_BLOCK = re.compile(
+    r"(\d{1,2})\s*(?:minuten|minuut|min)?\s*(?:hard|snel|sprint|intens|zwaar)")
+_EASY_BLOCK = re.compile(
+    r"(\d{1,2})\s*(?:minuten|minuut|min)?\s*(?:rustig|langzaam|licht|herstel|traag)")
+
+
+def interval_spec(prompt: str) -> tuple[int, int, int]:
+    """Read "40 minuten, 4 hard 2 rustig" out of a prompt, in seconds.
+
+    Anything the prompt does not say keeps its default. The block lengths are
+    matched on their own words rather than by position, because "4 minuten hard
+    en 2 rustig, 40 minuten totaal" says the numbers in no fixed order.
+    """
+    total, hard, easy = INTERVAL_DEFAULTS
+    m = _HARD_BLOCK.search(prompt)
+    if m:
+        hard = max(30, int(m.group(1)) * 60)
+    m = _EASY_BLOCK.search(prompt)
+    if m:
+        easy = max(30, int(m.group(1)) * 60)
+    # The session length is whatever minute figure is not one of the blocks.
+    # A block is short by nature, so anything from ten minutes up is the total.
+    blocks = {hard // 60, easy // 60}
+    for value in (int(v) for v in _MINUTES.findall(prompt)):
+        if value >= 10 and value not in blocks:
+            total = value * 60
+            break
+    return total, hard, easy
+
+
+def interval_blocks(graded: list[tuple[Track, float]], total_sec: int,
+                    hard_sec: int, easy_sec: int, per_artist: int = 2,
+                    recovery: float = 0.72) -> list[tuple[Track, str]]:
+    """Alternating fast and calm blocks, filled to real track lengths.
+
+    A playlist cannot cut a song in half, so a block ends at the first track
+    boundary past its length rather than exactly on it — a 2-minute recovery
+    built from 3-minute songs is 3 minutes, and pretending otherwise would put
+    the intervals out of step with the person running to them. The engine
+    reports what the blocks actually became.
+
+    Starts calm: the first block is the warm-up.
+    """
+    usable = [(t, b) for t, b in graded if t.duration_ms and t.duration_ms > 0]
+    if not usable:
+        return []
+    # The recovery tempo is a *ratio* of the work tempo, not a percentile of
+    # the pool. A percentile takes whatever the pool happens to hold: a pool of
+    # workout music put the "calm" blocks at 136 BPM against 152 — no contrast
+    # at all — while a pool with a few ballads in it dropped them to 59, which
+    # is not a recovery jog, it is a slow dance. Recovery pace sits at roughly
+    # 70% of interval pace whatever is in the library.
+    floor, hi = _spread(usable, 0.05, 0.85)
+    lo = max(floor, hi * recovery)
+    pool = list(usable)
     used: dict[str, int] = {}
-    for i in range(n):
-        target = hi - (hi - lo) * (i / max(1, n - 1))
-        order = sorted(range(len(pool)), key=lambda k: abs(pool[k][1] - target))
-        pick = next((k for k in order
-                     if used.get(pool[k][0].real_artist.lower(), 0) < per_artist),
-                    order[0])
-        t = pool.pop(pick)[0]
-        used[t.real_artist.lower()] = used.get(t.real_artist.lower(), 0) + 1
-        curve.append(t)
-    return curve
+    plan: list[tuple[Track, str]] = []
+    elapsed = 0.0
+    phase = "rustig"
+    while elapsed < total_sec and pool:
+        target = hi if phase == "hard" else lo
+        block_sec = hard_sec if phase == "hard" else easy_sec
+        block = 0.0
+        while block < block_sec and pool:
+            order = sorted(range(len(pool)),
+                           key=lambda k: abs(pool[k][1] - target))
+            pick = next((k for k in order
+                         if used.get(pool[k][0].real_artist.lower(), 0) < per_artist),
+                        order[0])
+            t, _bpm = pool.pop(pick)
+            used[t.real_artist.lower()] = used.get(t.real_artist.lower(), 0) + 1
+            plan.append((t, phase))
+            block += t.duration_ms / 1000.0
+            elapsed += t.duration_ms / 1000.0
+            if elapsed >= total_sec:
+                break
+        phase = "hard" if phase == "rustig" else "rustig"
+    return plan
 
 
 def audio_fit(track: Track, contexts: list[str]) -> float:
@@ -330,13 +567,18 @@ def named_genres(prompt: str, tracks: list[Track]) -> set[str]:
 
 
 def score_tracks(prompt: str, tracks: list[Track], similarity: dict[str, float],
-                 rng: random.Random | None = None) -> list[tuple[Track, float]]:
+                 rng: random.Random | None = None,
+                 signals: "Signals | None" = None) -> list[tuple[Track, float]]:
     """Rank `tracks` for `prompt`. `similarity` is {rating_key: cosine}.
 
     Tracks without an embedding are dropped: a missing vector is unknown, not
     neutral, and scoring it as 0 would let boosts alone float it to the top.
+
+    `signals` says whose likes and skips to weigh; see Signals. Left out, the
+    tracks' own fields are used.
     """
     rng = rng or random.Random()
+    signals = signals or LIBRARY_SIGNALS
     prompt = prompt.lower()
     contexts = active_contexts(prompt)
     tags = context_tags(contexts)
@@ -405,10 +647,13 @@ def score_tracks(prompt: str, tracks: list[Track], similarity: dict[str, float],
         hits = sum(1 for w in prompt_words if w in hay)
         score += min(hits, 3) * SCORING["BOOST_KEYWORD_MATCH"]
 
-        if t.liked:
+        if signals.liked(t):
             score += SCORING["BOOST_LIKED"]
-        if t.skips:
-            score -= min(t.skips, 4) * SCORING["PENALTY_SKIPPED"]
+        skips = signals.skips(t)
+        if skips >= 4:
+            continue                    # herhaald weggeklikt → nooit voorstellen
+        if skips:
+            score -= min(skips, 3) * SCORING["PENALTY_SKIPPED"]
         if t.play_count == 0:
             score += SCORING["BOOST_UNPLAYED"]
 
@@ -470,9 +715,18 @@ def select(scored: list[tuple[Track, float]], limit: int | None = None,
             break
 
     # A narrow prompt may not yield `cap` distinct artists. Top up from what
-    # the per-artist cap held back — those still cleared the score floor.
-    if len(picked) < cap:
-        picked.extend(overflow[:cap - len(picked)])
+    # the per-artist cap held back — those still cleared the score floor. The
+    # same-song check applies here too: the overflow was skipped before it was
+    # ever compared against `songs`, so topping up blind reintroduced exactly
+    # the album/compilation duplicate the loop above exists to prevent.
+    for track in overflow:
+        if len(picked) >= cap:
+            break
+        song = (track.real_artist.lower(), track.clean_title.lower())
+        if song in songs:
+            continue
+        picked.append(track)
+        songs.add(song)
 
     if picked:
         return picked

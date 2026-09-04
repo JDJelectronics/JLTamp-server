@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy import select, delete
 
 from ..db import SessionLocal
-from ..models import (User, UserLibraryAccess, Library, Session as AuthSession,
+from ..models import (User, UserLibraryAccess, Library, Meta, Session as AuthSession,
                       Playlist, PlaylistItem, LikedTrack, Track, UserTrackState,
                       PlayEvent)
 from ..security import new_invite, norm_email
@@ -81,6 +81,42 @@ def _set_access(db, user_id: int, library_ids: list[int]):
     for lid in set(library_ids):
         if lid in valid:
             db.add(UserLibraryAccess(user_id=user_id, library_id=lid))
+
+
+class AutoAccessBody(BaseModel):
+    library_ids: list[int]
+
+
+@router.get("/admin/auto-access")
+def get_auto_access(_: User = Depends(require_admin)):
+    """Welke bibliotheken nieuwe accounts automatisch krijgen."""
+    import json
+    db = SessionLocal()
+    try:
+        row = db.get(Meta, "auto_grant_libs")
+        ids = json.loads(row.value) if row and row.value else []
+        return {"library_ids": ids}
+    finally:
+        db.close()
+
+
+@router.post("/admin/auto-access")
+def set_auto_access(body: AutoAccessBody, _: User = Depends(require_admin)):
+    """Stel in welke bibliotheken nieuwe accounts automatisch krijgen."""
+    import json
+    db = SessionLocal()
+    try:
+        valid = {l.id for l in db.execute(select(Library)).scalars()}
+        ids = sorted({int(x) for x in body.library_ids if int(x) in valid})
+        row = db.get(Meta, "auto_grant_libs")
+        if not row:
+            row = Meta(key="auto_grant_libs")
+            db.add(row)
+        row.value = json.dumps(ids)
+        db.commit()
+        return {"library_ids": ids}
+    finally:
+        db.close()
 
 
 @router.get("/admin/users")

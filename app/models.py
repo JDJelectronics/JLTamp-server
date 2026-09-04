@@ -52,6 +52,16 @@ class User(Base):
     # Preferred language ('nl', 'en', 'fy', 'de', 'es-ES', 'pt-BR', 'pt-PT').
     # Chosen/auto-detected at signup; used to localize outgoing mail.
     lang: Mapped[str | None] = mapped_column(String, nullable=True)
+    # How much of your listening the OTHER people on this server may see:
+    #
+    #   "none"     — nothing at all; you do not appear as a listener.
+    #   "presence" — that you have music on, and nothing about what. THE DEFAULT.
+    #   "track"    — what you are playing, too.
+    #
+    # Default is the middle one on purpose: sharing the fact is friendly and
+    # costs nothing, sharing the song is a decision. Nobody is opted into
+    # broadcasting their taste by a migration.
+    share_activity: Mapped[str] = mapped_column(String, default="presence")
 
 
 class Session(Base):
@@ -269,6 +279,39 @@ Index("ix_pli_playlist_pos", PlaylistItem.playlist_id, PlaylistItem.position)
 Index("ix_artist_lib_sort", Artist.library_id, Artist.sort_name)
 Index("ix_album_lib_sort", Album.library_id, Album.sort_title)
 Index("ix_track_lib", Track.library_id)
+
+
+class TrackLyrics(Base):
+    """Lyrics kept for SEARCH, not for display.
+
+    Display already works without this: /lyrics/{id} reads the sidecar or the
+    embedded tag per track, on demand. But "which song has this line in it"
+    cannot be answered one file at a time — 78k tag reads over NFS per query is
+    not a search, so the text has to sit in the database.
+
+    Only LOCAL sources are indexed (`.lrc`/`.txt` next to the file, or the
+    embedded tag). Anything fetched online is displayed but never written here:
+    the index would then be a copy of someone else's database, and a self-hosted
+    server should not quietly accumulate that.
+
+    `search_text` is the normalised copy that queries actually run against —
+    lowercased, accents folded, punctuation collapsed to single spaces — so
+    "dont stop" finds "Don't stop", which a raw LIKE never would.
+    """
+    __tablename__ = "track_lyrics"
+    track_id: Mapped[int] = mapped_column(ForeignKey("tracks.id"), primary_key=True)
+    library_id: Mapped[int] = mapped_column(Integer, index=True, default=0)
+    text: Mapped[str] = mapped_column(String, default="")
+    search_text: Mapped[str] = mapped_column(String, default="")
+    source: Mapped[str] = mapped_column(String, default="")   # sidecar.lrc | sidecar.txt | embedded
+    synced: Mapped[bool] = mapped_column(Boolean, default=False)
+    # When the file was last looked at, and its mtime then — so a re-index can
+    # skip everything untouched instead of re-reading the whole library.
+    indexed_at: Mapped[int] = mapped_column(Integer, default=0)
+    mtime: Mapped[float] = mapped_column(Float, default=0.0)
+    # A track with no local lyrics gets a row too, with empty text: without it
+    # every re-index would re-read the ~75% of the library that has none.
+    found: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
 
 class ScanDir(Base):

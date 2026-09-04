@@ -52,7 +52,7 @@ class JobManager:
                 "status": "queued",
                 "prompt": prompt,
                 "progress": 0,
-                "step": "In de wachtrij...",
+                "step": "Even in de rij...",
                 "eta": 30.0,
                 "created_at": now,
             }
@@ -65,21 +65,31 @@ class JobManager:
     def _run(self, job_id: str, prompt: str, work: Callable[[str], dict]) -> None:
         start = time.time()
         self._patch(job_id, {"status": "processing", "progress": 10,
-                             "step": "Prompt analyseren...", "started_at": start})
+                             "step": "Ik zoek het voor je uit...",
+                             "started_at": start})
         try:
             result = work(prompt)
             duration = time.time() - start
-            if self._expired(job_id):
-                # Already reported as timed out; publishing now would contradict
-                # what the client was told.
-                return
             failed = result.get("status") == "error"
+            late = self._expired(job_id)
+            if late:
+                # This used to return here, on the grounds that publishing now
+                # contradicts the timeout the caller was told. But a successful
+                # run has already created the playlist in their library, so
+                # staying quiet means an error message followed by a playlist
+                # appearing out of nowhere. The playlist is the fact; report it.
+                # A client that gave up is no worse off than before.
+                if failed:
+                    return
+                print(f"⏱️  job {job_id} finished after {duration:.0f}s, past its "
+                      f"budget — publishing the result anyway")
             self._replace(job_id, {
                 "status": "error" if failed else "done",
                 "result": None if failed else result,
                 "error": result.get("message") if failed else None,
                 "progress": 100,
                 "eta": 0,
+                "late": late or None,
                 "duration": round(duration, 2),
                 "finished_at": time.time(),
             })

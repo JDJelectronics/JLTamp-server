@@ -217,33 +217,102 @@ class EmbeddingStore:
                 return np.zeros((0, self.dim), dtype=np.float32), []
             return np.asarray(self._vectors[rows], dtype=np.float32), present
 
+    def _scored_rows(self, query: np.ndarray, keys: list[str]
+                     ) -> tuple[np.ndarray, list[str]]:
+        """Similarity of `query` to each of `keys` we hold, plus those keys.
+
+        One matrix multiply against the memory-mapped array as it lies, then the
+        *scores* are indexed down to the keys asked for.
+
+        The obvious version — gather the rows for `keys` and multiply those —
+        is what this replaced, and it was costing more than everything else in
+        a request put together. Requests ask about the whole library, so
+        `self._vectors[rows]` copied 307 MB out of the memmap every single time:
+        1.30 s per prompt and per radio refill, against 0.02 s for the multiply
+        itself. Scoring every stored row and throwing a few away is far cheaper
+        than choosing rows first. Measured identical to the old path — same
+        keys, same order, difference exactly zero.
+        """
+        n = len(self._order)
+        if self._vectors is None or n == 0:
+            return np.zeros(0, dtype=np.float32), []
+        scores = self._vectors[:n] @ normalise(query)
+        rows, present = [], []
+        for k in keys:
+            row = self._keys.get(k)
+            # `row < n` guards an index that outlived the row it named.
+            if row is not None and row < n:
+                rows.append(row)
+                present.append(k)
+        if not rows:
+            return np.zeros(0, dtype=np.float32), []
+        return scores[np.asarray(rows)], present
+
     def search(self, query: np.ndarray, keys: list[str]) -> dict[str, float]:
         """Cosine similarity of `query` against `keys`, as {key: score}.
 
         Returns every score because the prompt scorer re-ranks with boosts and
-        needs them all. Building the dict over 72k keys is ~110 ms — negligible
-        against the embedding+playlist round-trip of a single prompt, but see
-        top_keys() for the bulk path where it is not.
+        needs them all. What is left of the cost is building the dict itself.
         """
-        mat, present = self.matrix(keys)
-        if not present:
-            return {}
-        scores = mat @ normalise(query)
-        return dict(zip(present, scores.tolist()))
+        with self._lock:
+            scores, present = self._scored_rows(query, keys)
+            if not present:
+                return {}
+            return dict(zip(present, scores.tolist()))
 
     def top_keys(self, query: np.ndarray, keys: list[str],
                  n: int) -> list[tuple[str, float]]:
         """The n most similar keys, without scoring the rest into a dict.
 
-        For the weekly job, which only wants the nearest tracks per user, not a
-        re-rank of everything: argpartition finds the top n in ~7 ms against the
-        ~110 ms a full dict + sort costs, which matters across every user.
+        For radio and the weekly job, which only want the nearest tracks and
+        not a re-rank of everything: argpartition beats a full sort, and
+        skipping the dict is what makes this the cheap path.
         """
-        mat, present = self.matrix(keys)
-        if not present:
-            return []
-        scores = mat @ normalise(query)
-        n = min(n, len(present))
-        idx = np.argpartition(-scores, n - 1)[:n]
-        idx = idx[np.argsort(-scores[idx])]
-        return [(present[i], float(scores[i])) for i in idx]
+        with self._lock:
+            scores, present = self._scored_rows(query, keys)
+            if not present:
+                return []
+            n = min(n, len(present))
+            if n <= 0:
+                return []
+            idx = np.argpartition(-scores, n - 1)[:n]
+            idx = idx[np.argsort(-scores[idx])]
+            return [(present[i], float(scores[i])) for i in idx]
+
+    def nearest_to_any(self, seeds: np.ndarray, keys: list[str],
+                       n: int) -> list[tuple[str, float]]:
+        """Top-n keys by their BEST similarity to ANY of the `seeds` rows.
+
+        The centroid of a diverse taste points to nowhere-in-particular, so a
+        'For you' built from the mean returns middle-of-the-road tracks. Scoring
+        each candidate by its nearest seed instead keeps every pick close to a
+        track the listener actually plays. One matmul (library × seeds), then a
+        max over the seeds — same cheap path as the single-query scorer.
+        """
+        with self._lock:
+            m = len(self._order)
+            if self._vectors is None or m == 0 or seeds is None or seeds.size == 0:
+                return []
+            s = np.asarray(seeds, dtype=np.float32)
+            if s.ndim == 1:
+                s = s[None, :]
+            norms = np.linalg.norm(s, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            s = s / norms
+            sims = self._vectors[:m] @ s.T          # (library, seeds)
+            best = sims.max(axis=1)                  # nearest seed per track
+            rows, present = [], []
+            for k in keys:
+                row = self._keys.get(k)
+                if row is not None and row < m:
+                    rows.append(row)
+                    present.append(k)
+            if not rows:
+                return []
+            bscore = best[np.asarray(rows)]
+            n = min(n, len(present))
+            if n <= 0:
+                return []
+            idx = np.argpartition(-bscore, n - 1)[:n]
+            idx = idx[np.argsort(-bscore[idx])]
+            return [(present[i], float(bscore[i])) for i in idx]

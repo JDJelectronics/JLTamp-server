@@ -317,12 +317,13 @@ def _resolve_album_art(album_id: int, sample_track: Path) -> str | None:
     return None
 
 
-# ── mixed folders: per-track cover art ───────────────────────────────────────
-# A bracketed "singles" folder — `[Singles]`, `[Singles & Loose Tracks]`, any
+# A bracketed "singles" folder — `[Singles & Losse Nummers]`, `[Singles]`, any
 # language — is a CONTAINER, not an album: it holds many unrelated tracks side by
 # side. The brackets are what distinguish it from a real album that happens to be
 # called "Singles" (those exist), so the folder cover is only overridden when the
-# name is bracketed.
+# name is bracketed. Generic on purpose — the public repo shares this code.
+# Verified against a real library: matches exactly the same tracks as the
+# old hardcoded, Dutch-only folder-name check.
 _SINGLES_DIR_RE = re.compile(r"[/\\]\[[^/\\]*singles[^/\\]*\][/\\]", re.IGNORECASE)
 
 
@@ -330,11 +331,11 @@ def _is_singles_dir(path_str: str) -> bool:
     return bool(_SINGLES_DIR_RE.search(path_str))
 
 
+# Folders that mix many DIFFERENT albums under one directory: a per-artist
+# singles folder, or a Various-Artists compilation. There the shared folder
+# cover.jpg is wrong for most tracks, so each track should show its OWN embedded
+# cover instead. Normal album folders keep the (correct) album cover.
 def _is_mixed_folder(sp: str, album_artist: str) -> bool:
-    """Folders that mix many DIFFERENT albums under one directory: a bracketed
-    singles folder, or a Various-Artists compilation. There the shared folder
-    cover.jpg is wrong for most tracks, so each track should show its OWN embedded
-    cover instead. Normal album folders keep the (correct) album cover."""
     return (_is_singles_dir(sp)
             or album_artist.strip().lower() in ("various artists", "various", "va"))
 
@@ -342,7 +343,7 @@ def _is_mixed_folder(sp: str, album_artist: str) -> bool:
 def _resolve_track_art(sp: str, album_art: str | None) -> str | None:
     """Per-track cover for tracks in mixed folders: the file's OWN embedded art,
     extracted to the data dir. Falls back to the album/folder art when the file
-    has no embedded picture."""
+    has no embedded picture. Keyed by a path hash so it is stable + idempotent."""
     data = _embedded_art_bytes(Path(sp))
     if not data:
         return album_art
@@ -369,11 +370,14 @@ IGNORE_FILES = (".plexignore", ".jltampignore")
 
 def _load_ignore(dir_path: Path, filenames: list[str] | None = None) -> list[str] | None:
     """Patterns for a directory, or None if it has no ignore file. `['*']` means
-    'ignore the whole folder'."""
+    'ignore the whole folder'.
+
+    `filenames` is the directory listing os.walk already produced. Using it to
+    check for an ignore file costs nothing, where the old `f.is_file()` probe
+    was a separate stat() per candidate name per directory — thousands of extra
+    round trips on a network mount, purely to discover the files aren't there.
+    """
     for name in IGNORE_FILES:
-        # Use the listing os.walk already produced: the old is_file() probe was a
-        # separate stat() per candidate name per directory — thousands of extra
-        # round trips on a network mount just to learn the files aren't there.
         if filenames is not None and name not in filenames:
             continue
         f = dir_path / name
@@ -388,9 +392,12 @@ def _load_ignore(dir_path: Path, filenames: list[str] | None = None) -> list[str
 
 
 def _iter_audio_dirs(root: Path):
-    """Yield `(directory, [audio files in it])`, one entry per directory, so the
-    caller can make a per-DIRECTORY decision instead of stat'ing every file just
-    to discover nothing changed."""
+    """Yield `(directory, [audio files in it])`, one entry per directory.
+
+    Grouped per directory rather than a flat file stream so the caller can make
+    a per-DIRECTORY decision (see the mtime skip in scan_library) instead of
+    having to stat every single file just to discover nothing changed.
+    """
     if not root.exists():
         log.warning("library folder %s does not exist", root)
         return
@@ -480,11 +487,11 @@ def scan_library(library_id: int, full: bool = False, keep_new: bool = False) ->
             return al
 
         # ── Quick-scan bookkeeping: per-directory mtimes ──────────────────
-        # Deciding "nothing changed" used to cost a stat() per FILE. On a large
-        # library on a network mount that is tens of thousands of stats —
-        # minutes on EVERY scan, even when nothing was added. A directory's
-        # mtime already tells us whether an entry was added, removed or renamed
-        # inside it, and checking a few thousand of those takes seconds.
+        # Deciding "nothing changed" used to cost a stat() per FILE. On the real
+        # library that is 78k stats over NFS — ~290s on EVERY scan, even when
+        # nothing was added. A directory's mtime already tells us whether an
+        # entry was added, removed or renamed inside it, and checking ~2k of
+        # those takes ~1.5s.
         #
         # Caveat, deliberately accepted: a directory's mtime does NOT change when
         # an existing file is edited in place, so a quick scan will not pick up a
@@ -493,6 +500,9 @@ def scan_library(library_id: int, full: bool = False, keep_new: bool = False) ->
             r.path: r.mtime for r in db.execute(
                 select(ScanDir).where(ScanDir.library_id == library_id)).scalars()
         }
+        # Files grouped per directory, so a skipped directory can still mark its
+        # known tracks as seen — otherwise the prune below would consider every
+        # file in it vanished and delete the lot.
         existing_by_dir: dict[str, list[str]] = {}
         for _p in existing:
             existing_by_dir.setdefault(os.path.dirname(_p), []).append(_p)
@@ -556,16 +566,15 @@ def scan_library(library_id: int, full: bool = False, keep_new: bool = False) ->
                     track_no = _int(_first(tags, "tracknumber"))
                     disc_no = _int(_first(tags, "discnumber"))
 
-                    # Singles folders: collapse every single into ONE collection tied
-                    # to the FOLDER artist, ignoring its source-album ID3 tag.
-                    # Otherwise each single's album tag spawns a phantom 1-track
-                    # "album" whose cover falls back to the shared folder cover — or,
-                    # for collaborations, to a DIFFERENT artist's folder cover. The
-                    # real performer is kept below as orig_artist; per-track covers
-                    # (mixed-folder branch) are unaffected. Layout assumed:
-                    # <Artist>/[Singles ...]/<file>
+                    # Singles folders: collapse every single into ONE "[Singles]"
+                    # collection tied to the FOLDER artist, ignoring its source-album
+                    # ID3 tag. Otherwise each single's album tag spawns a phantom
+                    # 1-track "album" whose cover falls back to the shared folder
+                    # cover — or, for collabs, to a DIFFERENT artist's folder cover.
+                    # The real performer is kept below as orig_artist; per-track
+                    # covers (mixed-folder branch) are unaffected.
                     if _is_singles_dir(sp):
-                        album_title = path.parent.name          # the [Singles ...] folder
+                        album_title = path.parent.name        # the [Singles ...] folder
                         folder_artist = path.parent.parent.name
                         if folder_artist:
                             album_artist = folder_artist
@@ -633,7 +642,8 @@ def scan_library(library_id: int, full: bool = False, keep_new: bool = False) ->
 
         # Remember the directory mtimes so the NEXT scan can skip untouched
         # folders. Only after a clean run: a cancelled scan never visited the
-        # rest of the tree.
+        # rest of the tree, and storing those would make the next scan skip
+        # folders it has not actually read yet.
         if not cancelled:
             for _dp, _dm in fresh_dir_mtimes.items():
                 row = db.execute(select(ScanDir).where(
@@ -642,6 +652,7 @@ def scan_library(library_id: int, full: bool = False, keep_new: bool = False) ->
                     row.mtime = _dm
                 else:
                     db.add(ScanDir(library_id=library_id, path=_dp, mtime=_dm))
+            # Directories that disappeared shouldn't linger in the table.
             for _dp in set(dir_mtimes) - set(fresh_dir_mtimes):
                 db.execute(delete(ScanDir).where(
                     ScanDir.library_id == library_id, ScanDir.path == _dp))

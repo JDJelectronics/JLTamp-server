@@ -115,15 +115,24 @@ def whoami():
 
 @app.get("/ai/suggest")
 def suggest():
+    # Kort en zoals iemand het intypt, niet als een folder. Elk voorbeeld is
+    # tegen de echte bibliotheek getoetst, want een suggestie die niets goeds
+    # oplevert is erger dan een saaie: een sfeerzin ("zaterdagochtend, koffie,
+    # niks moeten") wordt door de tekstmatching gekaapt door nummers die die
+    # wóórden in de titel hebben. Genre, tijdvak, artiest en tempo werken wel.
     return jsonify({"suggestions": [
-        "chille herfstavond met zachte piano",
-        "energieke workout met stevige beats",
-        "focus-flow voor een lange codeersessie",
-        "gezellige vrijdagavond met vrienden",
-        "melancholische regenachtige zondag",
-        "opzwepende feestset voor laat op de avond",
-        "rustige zondagochtend met koffie",
-        "nostalgische jaren 80 hits om mee te zingen",
+        "afbouwen tot ik in slaap val",
+        "wakker worden zonder te schrikken",
+        "feestboog: opbouwen en weer afbouwen",
+        "intervaltraining: 4 hard, 2 rustig, 40 minuten",
+        "de leukste van Queen",
+        "iets zoals Queen, maar niet Queen",
+        "gewoon metal",
+        "hardrock uit de jaren 80",
+        "jaren 90 hiphop",
+        "rustige jazz",
+        "klassiek, alleen piano",
+        "nederpop",
     ]})
 
 
@@ -173,6 +182,25 @@ def playlist():
                     "poll_interval": 1000, "timeout": config.JOB_TIMEOUT_SEC * 1000})
 
 
+@app.post("/ai/foryou")
+def foryou():
+    """Een persoonlijke mix uit het smaakprofiel van de aanroeper (geen prompt).
+    Async job, net als /ai/playlist — de client pollt /ai/status."""
+    token = _caller_token()
+    if config.REQUIRE_USER_TOKEN and not engine.user_context(token):
+        return jsonify({"error": "ongeldig of ontbrekend JLTamp-token"}), 401
+    guard = f"{token[:12]}:foryou"
+    running = jobs.existing(guard)
+    if running:
+        return jsonify({"status": "already_running", "job_id": running,
+                        "poll_interval": 1000, "timeout": config.JOB_TIMEOUT_SEC * 1000})
+    if jobs.full():
+        return jsonify({"error": "server busy, probeer het zo opnieuw"}), 429
+    job_id = jobs.submit(guard, lambda _g: engine.foryou(token))
+    return jsonify({"status": "processing", "job_id": job_id,
+                    "poll_interval": 1000, "timeout": config.JOB_TIMEOUT_SEC * 1000})
+
+
 @app.post("/ai/weekly")
 def weekly():
     """Build the weekly per-user playlists now. Admin token required — this
@@ -197,12 +225,14 @@ def radio():
     if config.REQUIRE_USER_TOKEN and not engine.user_context(token):
         return jsonify({"error": "ongeldig of ontbrekend JLTamp-token"}), 401
     body = request.get_json(silent=True) or {}
-    seed = (body.get("seed") or "").strip()
+    seed = body.get("seed")
+    seed = seed.strip() if isinstance(seed, str) else seed
     if not seed:
         return jsonify({"error": "seed is leeg"}), 400
     exclude = set(str(x) for x in (body.get("exclude") or []))
+    dislike = [str(x) for x in (body.get("dislike") or [])]
     count = min(int(body.get("count") or 20), 50)
-    return jsonify(engine.radio(seed, exclude, count))
+    return jsonify(engine.radio(seed, exclude, count, dislike=dislike))
 
 
 @app.get("/ai/status")

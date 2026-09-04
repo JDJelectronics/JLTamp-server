@@ -76,6 +76,9 @@ EMBED_ENDPOINT = f"{EMBED_URL}/embedding"
 # balance. A 256-track batch takes ~27s, comfortably under EMBED_TIMEOUT.
 EMBED_BATCH = _env_int("EMBED_BATCH", 256)
 EMBED_TIMEOUT = _env_int("EMBED_TIMEOUT", 120)
+# Voorvoegsel voor de zoek-prompt (asymmetrische retrieval bij een instructiemodel).
+# Leeg = geen prefix (huidig gedrag). Instelbaar via env EMBED_QUERY_PREFIX.
+EMBED_QUERY_PREFIX = _env("EMBED_QUERY_PREFIX", "")
 
 # ── This service ─────────────────────────────────────────────────────────────
 HOST = _env("AI_HOST", "0.0.0.0")
@@ -114,8 +117,28 @@ JOB_TIMEOUT_SEC = _env_int("AI_JOB_TIMEOUT_SEC", 120)
 # Weekly per-user playlists only run once we can actually know a taste. A user
 # who has barely listened gets no "personal" playlist rather than a random one.
 # Both must be met: enough of an account history, and enough listening in it.
-MIN_ACCOUNT_AGE_SEC = _env_int("AI_MIN_ACCOUNT_AGE_DAYS", 0) * 86400
+#
+# The default is the month the rule describes. It used to be 0, which turned
+# the account-age half of that rule off entirely while engine.py went on
+# explaining why it was there — so a day-old account got a "personal" mix built
+# from whatever it happened to have played. Set AI_MIN_ACCOUNT_AGE_DAYS=0 to
+# deliberately switch it off (handy on a single-user install).
+MIN_ACCOUNT_AGE_SEC = _env_int("AI_MIN_ACCOUNT_AGE_DAYS", 30) * 86400
 MIN_TASTE_SEED = _env_int("AI_MIN_TASTE_SEED", 25)
+# Hoeveel het persoonlijke smaakprofiel in ELKE semantische aanbeveling meeweegt
+# (Spotify-stijl). 0 = uit; ~0.25 = subtiel persoonlijk, de prompt blijft
+# leidend. Alleen actief bij genoeg luistergeschiedenis (>= MIN_TASTE_SEED).
+TASTE_BLEND = _env_float("AI_TASTE_BLEND", 0.25)
+# Hoe sterk radio wegduwt van "minder zoals dit"-tracks (0 = uit).
+RADIO_DISLIKE_WEIGHT = _env_float("AI_RADIO_DISLIKE", 0.5)
+
+# ── LLM-query-verrijking (optioneel) ─────────────────────────────────────────
+# Een klein lokaal model verrijkt vrije prompts met sfeer-/stijlwoorden voor een
+# betere semantische match. Fail-safe: uit/fout -> bestaand gedrag.
+USE_LLM_INTENT = _env("AI_USE_LLM_INTENT", "1") == "1"
+OLLAMA_URL = _env("AI_OLLAMA_URL", "http://127.0.0.1:11434")
+LLM_MODEL = _env("AI_LLM_MODEL", "qwen3:1.7b")
+LLM_TIMEOUT = _env_float("AI_LLM_TIMEOUT", 4.0)
 MAX_JOBS = _env_int("AI_MAX_JOBS", 20)
 
 # ── Scoring weights ──────────────────────────────────────────────────────────
@@ -140,7 +163,7 @@ SCORING = {
     "BOOST_AUDIO_FEATURE": 0.14,
     "BOOST_LIKED": 0.05,
     "PENALTY_ARTIST_REPEAT": 0.03,
-    "PENALTY_SKIPPED": 0.04,
+    "PENALTY_SKIPPED": 0.10,
     "BOOST_UNPLAYED": 0.02,
     "MAX_TRACKS": _env_int("AI_MAX_TRACKS", 50),
 }

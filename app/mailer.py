@@ -313,11 +313,16 @@ def send_new_music(to_email: str, server_name: str, album_count: int,
               f'color:#04120f;font-weight:700;text-decoration:none;padding:12px 20px;border-radius:10px">'
               f'Open in JLTamp</a>' if root else "")
 
+    logo_ok = _LOGO_PATH.exists()
+    logo_html = ('<img src="cid:logo" width="64" height="64" alt="JLTamp" '
+                 'style="display:block;border-radius:14px;margin:0 0 16px">' if logo_ok else "")
+
     msg.add_alternative(
         f"""\
 <html><body style="font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
                    background:#0e0e11;color:#e8e8ea;padding:32px">
   <div style="max-width:520px;margin:0 auto;background:#17171c;border-radius:16px;padding:32px">
+    {logo_html}
     <h1 style="margin:0 0 4px;font-size:22px;color:#fff">🎵 Nieuwe muziek</h1>
     <p style="margin:0 0 20px;color:#a0a0aa">
       <b style="color:#00d4aa">{track_count}</b> nieuwe nummers in
@@ -334,5 +339,12 @@ def send_new_music(to_email: str, server_name: str, album_count: int,
 </body></html>""",
         subtype="html",
     )
+    # Attach the brand logo as an inline (cid:logo) image on the HTML part.
+    if logo_ok:
+        try:
+            msg.get_payload()[1].add_related(_LOGO_PATH.read_bytes(), maintype="image",
+                                             subtype="png", cid="<logo>")
+        except Exception:
+            log.warning("kon logo niet aan nieuwe-muziek-mail hangen")
     send_async(msg)
     return True

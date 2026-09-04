@@ -68,6 +68,30 @@ try:
 except DimensionMismatch:
     check("ander model wordt geweigerd", True)
 
+print("\n── Zoeken zonder de grote kopie ──")
+# search() en top_keys() vermenigvuldigen nu één keer over de hele memmap en
+# indexeren daarna de scores, in plaats van eerst 307 MB aan rijen te kopiëren.
+# Dat moet exact hetzelfde opleveren als de kopieerweg, anders is de winst
+# waardeloos.
+all_keys = list(vecs) + list(big)
+probe = rng.normal(size=8).astype(np.float32)
+mat, present = store.matrix(all_keys)
+expect = dict(zip(present, (mat @ normalise(probe)).tolist()))
+got = store.search(probe, all_keys)
+check("dezelfde sleutels", set(got) == set(expect), len(got))
+check("dezelfde scores",
+      all(abs(got[k] - expect[k]) < 1e-6 for k in expect),
+      max(abs(got[k] - expect[k]) for k in expect) if expect else "leeg")
+
+ranked = sorted(expect, key=expect.get, reverse=True)[:5]
+check("top_keys geeft dezelfde volgorde",
+      [k for k, _ in store.top_keys(probe, all_keys, 5)] == ranked)
+check("top_keys van niets is leeg", store.top_keys(probe, all_keys, 0) == [])
+check("onbekende sleutels tellen niet mee",
+      store.search(probe, ["bestaat-niet"]) == {})
+check("de dichtstbijzijnde van zichzelf is zichzelf",
+      store.top_keys(vecs["t3"], all_keys, 1)[0][0] == "t3")
+
 print("\n── Prompt-analyse ──")
 check("jaartal uit 'jaren 80'", scoring.extract_year("jaren 80 hits") == 1980)
 check("jaartal uit '90s'", scoring.extract_year("90s rock") == 1990)
@@ -171,6 +195,30 @@ check("techno triggert geen uitsluiting",
 check("echte uitsluiting werkt nog", scoring.exclusions("feest zonder metal") == ["metal"])
 check("geen-uitsluiting werkt nog", scoring.exclusions("geen hardstyle") == ["hardstyle"])
 
+# Een uitsluiting wordt als substring op de metadata gelegd, dus een kort
+# alledaags woord sloopt de halve bibliotheek: "niet bij na hoef te denken"
+# gooide alles met de letters b-i-j eruit.
+check("korte functiewoorden sluiten niets uit",
+      scoring.exclusions("iets waar ik niet bij na hoef te denken") == [],
+      scoring.exclusions("iets waar ik niet bij na hoef te denken"))
+check("'niet meer' is grammatica, geen filter",
+      scoring.exclusions("nummers die ik al jaren niet meer hoor") == [])
+check("'geen muziek' sluit niet het woord muziek uit",
+      scoring.exclusions("geen muziek van vroeger") == [])
+
+print("\n── Een ontkenning zet de context niet aan ──")
+# "niks te hard" gaf hardstyle terug: 'hard' zette een context aan die 130-200
+# BPM wil, en niemand keek naar de ontkenning ervoor.
+check("'niks te hard' vraagt niet om harde muziek",
+      "hard" not in scoring.active_contexts("niks te hard, mijn moeder is er"),
+      scoring.active_contexts("niks te hard, mijn moeder is er"))
+check("'geen hardstyle' zet de hard-context ook uit",
+      "hard" not in scoring.active_contexts("feest maar geen hardstyle"))
+check("zonder ontkenning gewoon aan",
+      "hard" in scoring.active_contexts("lekker hard"))
+check("een andere context blijft staan",
+      "feest" in scoring.active_contexts("feest maar geen hardstyle"))
+
 print("\n── Verzamelalbums ──")
 comp = mk("c1", "Various Artists", "hartenbreker", orig_artist="Doe Maar",
           album="Radio Piepschuim")
@@ -225,6 +273,48 @@ check("lange naam matcht gewoon",
       scoring.names_artist("de leukste van metallica", "Metallica"))
 check("korte prompt telt als naam", scoring.names_artist("adele", "Adele"))
 
+print("\n── Likes en skips lekken niet tussen gebruikers ──")
+# De Track-objecten zijn gedeeld: library.snapshot() geeft iedereen dezelfde
+# lijst. Eerder schreef de engine de likes van de beller op die objecten, dus
+# scoorde de ene gebruiker met de geschiedenis van de andere — en wie zonder
+# token vroeg, erfde die van de laatste beller.
+shared = [mk("u1", "A", "X"), mk("u2", "B", "Y")]
+sims_u = {"u1": 0.5, "u2": 0.5}
+ann = scoring.Signals(likes={"u1"}, skips={})
+bob = scoring.Signals(likes={"u2"}, skips={"u1": 4})
+
+sc_ann = {t.rating_key: s for t, s in
+          scoring.score_tracks("muziek", shared, sims_u, signals=ann)}
+sc_bob = {t.rating_key: s for t, s in
+          scoring.score_tracks("muziek", shared, sims_u, signals=bob)}
+check("de like van A telt voor A", sc_ann["u1"] > sc_ann["u2"],
+      f"{sc_ann['u1']:.3f} vs {sc_ann['u2']:.3f}")
+check("de like van B telt voor B", sc_bob["u2"] > sc_bob["u1"],
+      f"{sc_bob['u2']:.3f} vs {sc_bob['u1']:.3f}")
+check("scoren muteert de gedeelde tracks niet",
+      all(t.liked is False and t.skips == 0 for t in shared),
+      [(t.rating_key, t.liked, t.skips) for t in shared])
+
+# Zonder signalen gelden de velden van de track zelf, zoals de library ze zette.
+own = [mk("o1", "A", "X"), mk("o2", "B", "Y", liked=True)]
+sc_own = {t.rating_key: s for t, s in
+          scoring.score_tracks("muziek", own, {"o1": 0.5, "o2": 0.5})}
+check("zonder beller telt de library-geschiedenis", sc_own["o2"] > sc_own["o1"])
+
+print("\n── Aanvullen levert geen dubbel nummer op ──")
+# De opvulling uit de overflow sloeg de dubbel-check over. Twee exemplaren van
+# hetzelfde nummer — één op het album, één op een verzamelaar — komen allebei
+# in de overflow terecht zodra de artiestlimiet vol is, want die tracks worden
+# nooit aan `songs` toegevoegd. De aanvulling pakte ze daarna allebei.
+dup = [mk("d1", "Adele", "Hello"), mk("d2", "Adele", "Someone Like You"),
+       mk("d3", "Adele", "Rolling In The Deep"),
+       mk("d4", "Adele", "Skyfall"),
+       mk("d5", "Various Artists", "Skyfall", orig_artist="Adele")]
+picked = scoring.select([(t, 0.9) for t in dup], limit=5, per_artist=3)
+titles = [t.clean_title.lower() for t in picked]
+check("geen dubbel nummer na aanvullen", len(titles) == len(set(titles)), titles)
+check("wel aangevuld tot wat er is", len(picked) == 4, len(picked))
+
 print("\n── Trefwoorden overstemmen semantiek niet ──")
 # 'Focus' in de titel mag een écht beter passend nummer niet verslaan.
 kw = [mk("k1", "Ariana Grande", "Focus"), mk("k2", "Brian Eno", "Ambient 1")]
@@ -233,6 +323,115 @@ sc = {t.rating_key: s for t, s in
                            {"k1": 0.45, "k2": 0.62})}
 check("hogere semantische score wint van woordmatch",
       sc["k2"] > sc["k1"], f"k2={sc['k2']:.3f} k1={sc['k1']:.3f}")
+
+print("\n── Een afbouw loopt niet halverwege weer omhoog ──")
+# De echte pool is tweetoppig: iemands favorieten zijn opzwepend, hun
+# slaapmuziek is traag, en daartussen zit vrijwel niets. Zodra het trage
+# materiaal op was, koos "dichtst bij het doeltempo" weer snelle nummers en
+# klom de afbouw van 27 terug naar 117 BPM.
+def tempo(key, bpm, artist="A"):
+    return mk(key, f"{artist}{bpm}", f"Song {key}", features={"bpm": bpm})
+
+
+bimodal = [(tempo(f"s{i}", 120 - i % 5), 120 - i % 5) for i in range(40)]
+bimodal += [(tempo(f"t{i}", 50 - i), 50 - i) for i in range(6)]
+curve = scoring.descending_tempo_curve(bimodal, 50)
+speeds = [t.features["bpm"] for t in curve]
+check("het tempo loopt alleen omlaag",
+      all(speeds[i + 1] <= speeds[i] + 2 for i in range(len(speeds) - 1)), speeds)
+check("liever korter dan verkeerd om", len(curve) < 50, len(curve))
+
+# Met genoeg materiaal blijft het gewoon een volle, gladde glijbaan. De pool
+# moet ruim zijn: de curve begint op het 75e percentiel, dus alles daarboven
+# doet per definitie niet mee — met precies 60 nummers vallen er 14 af en haalt
+# een eerlijke curve de 50 niet.
+dense = [(tempo(f"d{i}", 140 - i, f"Art{i}"), 140 - i) for i in range(80)]
+full = scoring.descending_tempo_curve(dense, 50)
+fast = [t.features["bpm"] for t in full]
+check("volle curve bij genoeg materiaal", len(full) == 50, len(full))
+check("en die daalt van hoog naar laag", fast[0] > fast[-1], f"{fast[0]} → {fast[-1]}")
+
+print("\n── Tempocurves in andere vormen ──")
+material = [(tempo(f"m{i}", 60 + i, f"Art{i}"), 60 + i) for i in range(90)]
+
+up = scoring.tempo_arc(material, 30, "up")
+ups = [t.features["bpm"] for t in up]
+check("opbouw loopt alleen omhoog",
+      all(ups[i + 1] >= ups[i] - 2 for i in range(len(ups) - 1)), ups)
+check("opbouw begint traag en eindigt snel", ups[-1] > ups[0], f"{ups[0]} → {ups[-1]}")
+
+peak = scoring.tempo_arc(material, 30, "peak")
+peaks = [t.features["bpm"] for t in peak]
+top = peaks.index(max(peaks))
+check("de boog piekt in het midden", 8 < top < 22, f"piek op {top} van {len(peaks)}")
+check("en komt daarna terug omlaag", peaks[-1] < max(peaks) - 10,
+      f"{max(peaks)} → {peaks[-1]}")
+check("onbekende vorm geeft niets", scoring.tempo_arc(material, 10, "zigzag") == [])
+
+print("\n── Intervaltraining ──")
+check("standaard als de prompt niets zegt",
+      scoring.interval_spec("intervaltraining") == (1800, 240, 120),
+      scoring.interval_spec("intervaltraining"))
+check("totale duur uit de prompt",
+      scoring.interval_spec("intervaltraining van 40 minuten")[0] == 2400)
+check("blokken uit de prompt, ongeacht volgorde",
+      scoring.interval_spec("3 minuten hard en 1 minuut rustig, 40 minuten")
+      == (2400, 180, 60),
+      scoring.interval_spec("3 minuten hard en 1 minuut rustig, 40 minuten"))
+
+# Elk nummer duurt 200 s in mk(), dus het plan is precies uit te rekenen:
+# warmdraaien (1 nummer), dan blokken van 2 hard en 1 rustig tot 30 minuten.
+ivl = [(tempo(f"i{i}", 60 + i * 2, f"Art{i}"), 60 + i * 2) for i in range(60)]
+plan = scoring.interval_blocks(ivl, 1800, 240, 120)
+phases = [p for _, p in plan]
+check("begint rustig, als warming-up", phases[0] == "rustig", phases[:3])
+check("wisselt af tussen hard en rustig", "hard" in phases and "rustig" in phases)
+check("vult de gevraagde tijd",
+      sum(t.duration_ms for t, _ in plan) / 1000 >= 1800,
+      sum(t.duration_ms for t, _ in plan) / 1000)
+hard_bpm = [t.features["bpm"] for t, p in plan if p == "hard"]
+easy_bpm = [t.features["bpm"] for t, p in plan if p == "rustig"]
+check("de harde blokken zijn echt sneller",
+      sum(hard_bpm) / len(hard_bpm) > sum(easy_bpm) / len(easy_bpm),
+      f"{sum(hard_bpm) / len(hard_bpm):.0f} vs {sum(easy_bpm) / len(easy_bpm):.0f}")
+
+# Zonder speelduur valt een blok niet te vullen; die tracks doen niet mee.
+timeless = [mk("z1", "A", "X", features={"bpm": 120})]
+timeless[0].duration_ms = 0
+check("nummers zonder speelduur vallen af",
+      scoring.interval_blocks([(timeless[0], 120)], 600, 240, 120) == [])
+
+print("\n── De engine routeert niet op een toevallige woordtreffer ──")
+# _find_artist besliste met een kale substring-test welke strategie een prompt
+# kreeg. Dat is precies waar names_artist tegen geschreven is: "instrumentale
+# focus muziek" werd zo een best-of van de band Focus. Een misplaatste boost is
+# hinderlijk; een hele playlist van de verkeerde artiest is dat veel meer.
+from types import SimpleNamespace                              # noqa: E402
+
+from app.engine import Engine                                  # noqa: E402
+
+eng = Engine.__new__(Engine)          # geen netwerk, geen __init__
+eng._artists, eng._artists_at = {}, 0.0
+eng.library = SimpleNamespace(loaded_at=1.0)
+
+lib = [mk("f1", "Focus", "Hocus Pocus"), mk("f2", "Adele", "Hello"),
+       mk("f3", "Metallica", "One"),
+       mk("f4", "Various Artists", "Hartenbreker", orig_artist="Doe Maar")]
+
+check("gewoon woord routeert niet naar een artiest",
+      eng._find_artist("instrumentale focus muziek om bij te werken", lib) is None,
+      eng._find_artist("instrumentale focus muziek om bij te werken", lib))
+check("met aanwijzer is het wel de band",
+      eng._find_artist("de leukste van focus", lib) == "Focus")
+check("lange naam wordt gewoon gevonden",
+      eng._find_artist("iets zoals metallica", lib) == "Metallica")
+check("artiest op een verzamelalbum wordt gevonden",
+      eng._find_artist("de beste van doe maar", lib) == "Doe Maar",
+      eng._find_artist("de beste van doe maar", lib))
+check("verzamel-plaatshouder is geen artiest",
+      "various artists" not in eng._artist_index(lib))
+check("index wordt hergebruikt tot de library ververst",
+      eng._artist_index(lib) is eng._artist_index(lib))
 
 shutil.rmtree(tmp, ignore_errors=True)
 print(f"\n{'❌ ' + str(len(fails)) + ' gefaald: ' + ', '.join(fails) if fails else '✅ alles geslaagd'}")

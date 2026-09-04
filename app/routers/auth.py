@@ -8,6 +8,7 @@ per-user bearer token (the `X-Plex-Token`).
 from __future__ import annotations
 
 import time
+import json
 
 from fastapi import APIRouter, Request, HTTPException, Depends
 from pydantic import BaseModel
@@ -22,6 +23,7 @@ from ..deps import create_session, require_user
 from ..security import new_invite
 from .. import mailer
 from ..serializers import user_thumb_ref
+from ..models import Meta, Library
 
 router = APIRouter()
 
@@ -39,7 +41,7 @@ FAIL_WINDOW = 900        # failures are counted over 15 minutes
 # The IP limit is the real defence: an attacker guesses from somewhere, and 5
 # tries per quarter of an hour makes guessing hopeless. The per-ACCOUNT limit is
 # deliberately much higher, because a strict one is a weapon *against* the user:
-# anyone could lock Admin out of his own server by typing his password wrong 5
+# anyone could lock the admin out of their own server by typing a password wrong 5
 # times from a café. It exists only to stop a botnet spreading tries over many
 # IPs against one account.
 FAIL_LIMIT_IP = 5
@@ -161,6 +163,8 @@ def _user_dict(u: User) -> dict:
         "thumb": user_thumb_ref(u),
         # Whether this user gets the "new music" email digest after a scan.
         "notifyNewMusic": bool(u.notify_new_music),
+        # How much of their listening the others may see: none | presence | track.
+        "shareActivity": u.share_activity or "presence",
     }
 
 
@@ -325,6 +329,20 @@ def register(body: RegisterBody, request: Request):
                     lang=(body.lang or None))
         db.add(user)
         db.commit()
+        # Nieuwe self-registranten automatisch toegang geven tot de door de admin
+        # ingestelde bibliotheken (meta-sleutel 'auto_grant_libs', JSON-lijst van
+        # library-ids). Leeg/afwezig -> geen toegang (oude gedrag).
+        _row = db.get(Meta, "auto_grant_libs")
+        if _row and _row.value:
+            try:
+                _libs = json.loads(_row.value)
+            except ValueError:
+                _libs = []
+            _valid = {l.id for l in db.execute(select(Library)).scalars()}
+            for _lid in {int(x) for x in _libs}:
+                if _lid in _valid:
+                    db.add(UserLibraryAccess(user_id=user.id, library_id=_lid))
+            db.commit()
         mailer.send_welcome(user.email, user.display_name or user.email,
                             config.SERVER_NAME, base_url=str(request.base_url),
                             lang=user.lang)
@@ -335,7 +353,7 @@ def register(body: RegisterBody, request: Request):
         db.close()
 
 
-# ── First-run setup ────────────────────────────────────────────────────────────
+# ── First-run setup ──────────────────────────────────────────────────────────
 # On a fresh install the owner/admin row exists (seeded from JLTAMP_ADMIN_EMAIL)
 # but has NO usable password — the built-in "changeme" default is refused by
 # seed_admin(). Instead of baking a password into docker-compose, the very first
@@ -413,6 +431,36 @@ def me(user: User = Depends(require_user)):
 
 class NotifyBody(BaseModel):
     enabled: bool
+
+
+SHARE_LEVELS = ("none", "presence", "track")
+
+
+class ShareBody(BaseModel):
+    level: str
+
+
+@router.post("/users/me/activity")
+def set_share_activity(body: ShareBody, user: User = Depends(require_user)):
+    """How much of your listening the other people on this server may see.
+
+    "none" makes you invisible to them, "presence" (the default) says only that
+    you have music on, "track" says what it is. Enforced in one place —
+    /status/presence — so there is a single answer to "who can see what".
+    """
+    level = (body.level or "").strip().lower()
+    if level not in SHARE_LEVELS:
+        raise HTTPException(status_code=400, detail=f"level must be one of {SHARE_LEVELS}")
+    db = SessionLocal()
+    try:
+        u = db.get(User, user.id)
+        if not u:
+            raise HTTPException(status_code=404, detail="User not found")
+        u.share_activity = level
+        db.commit()
+        return {"ok": True, "shareActivity": level}
+    finally:
+        db.close()
 
 
 @router.post("/users/me/notify")
