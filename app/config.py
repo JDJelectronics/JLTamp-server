@@ -40,6 +40,13 @@ ADMIN_NAME = os.environ.get("JLTAMP_ADMIN_NAME", "Admin")
 # Whether anyone can self-register (False = invite-only, the user's choice).
 OPEN_REGISTRATION = _bool("JLTAMP_OPEN_REGISTRATION", False)
 
+# Whether the playlist importers are available at all (False = off, the default).
+# Off means: the endpoints answer 403 AND the clients hide the UI for them, so a
+# deployment that wants no outbound lookups has no dead buttons either.
+# Advertised in the /api descriptor, next to OPEN_REGISTRATION, so an
+# unauthenticated login screen can already know.
+IMPORTERS = _bool("JLTAMP_IMPORTERS", False)
+
 SERVER_NAME = os.environ.get("SERVER_NAME", "JLTamp")
 RESCAN_INTERVAL_MIN = int(os.environ.get("RESCAN_INTERVAL_MIN", "0") or 0)
 PORT = int(os.environ.get("PORT", "32400") or 32400)

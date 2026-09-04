@@ -196,6 +196,8 @@ def _detect(url: str) -> str:
 def import_playlist(url: str = "", title: str = "", user: User = Depends(require_user)):
     """Read a public playlist's track listing, match it to the library, and create
     a JLTamp playlist from the matches. Returns a report (matched / unmatched)."""
+    if not config.IMPORTERS:
+        raise HTTPException(403, "The playlist importer is disabled on this server")
     url = (url or "").strip()
     source = _detect(url)
     if not source:

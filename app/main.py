@@ -47,6 +47,7 @@ async def lifespan(_app: FastAPI):
     log.info("  data dir    : %s", config.DATA_DIR)
     log.info("  admin       : %s", config.ADMIN_EMAIL)
     log.info("  registration: %s", "open" if config.OPEN_REGISTRATION else "invite-only")
+    log.info("  importers   : %s", "on" if config.IMPORTERS else "off")
     log.info("═" * 60)
     yield
     # Shutdown: one last consistent snapshot so a clean restart/redeploy always
@@ -172,6 +173,9 @@ def _descriptor():
         # Public, unauthenticated: the login screen needs to know whether to offer
         # a "create account" panel at all, and it has to ask before signing in.
         "openRegistration": config.OPEN_REGISTRATION,
+        # Same idea for the playlist importers: the client hides the import UI
+        # when this is false, so a disabled feature shows no button at all.
+        "importers": config.IMPORTERS,
         "status": scan_state(),
     }
 

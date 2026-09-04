@@ -270,6 +270,8 @@ class PlexImportBody(BaseModel):
 def import_plex_likes(body: PlexImportBody, admin: User = Depends(require_admin)):
     """Import the calling admin's Plex track ratings as JLTamp 'likes'. Only ever
     issues GET requests to Plex — it never writes to or modifies Plex."""
+    if not config.IMPORTERS:
+        raise HTTPException(403, "The importers are disabled on this server")
     import json as _json
     import urllib.parse
     import urllib.request

@@ -267,6 +267,7 @@ All settings are environment variables (see [`.env.example`](.env.example)):
 | `JLTAMP_ADMIN_EMAIL` | `admin@example.com` | Admin email (login + owner) |
 | `SERVER_NAME` | `JLTamp` | Friendly name shown in the app |
 | `JLTAMP_OPEN_REGISTRATION` | `false` | `true` = anyone can register; `false` = invite‑only |
+| `JLTAMP_IMPORTERS` | `false` | `true` enables the playlist importers. Off = the endpoints answer 403 **and** the app hides the import cards, so no button offers what the server refuses |
 | `PORT` | `32400` | HTTP port the server listens on |
 | `LOCAL_URL` | *(blank)* | Optional LAN/Tailscale address(es) for faster local streaming |
 | `SMTP_*` | *(blank)* | Optional SMTP for invites / password‑reset / welcome mail |
