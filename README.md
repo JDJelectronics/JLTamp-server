@@ -14,6 +14,10 @@
     <img alt="Get it on Google Play"
          src="https://img.shields.io/badge/Google%20Play-JLTamp-00C896?logo=googleplay&logoColor=white&style=for-the-badge">
   </a>
+  <a href="https://apps.apple.com/app/id6807401608">
+    <img alt="Download on the App Store"
+         src="https://img.shields.io/badge/App%20Store-JLTamp-0D96F6?logo=appstore&logoColor=white&style=for-the-badge">
+  </a>
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue?style=for-the-badge">
   <img alt="Self-hosted" src="https://img.shields.io/badge/self--hosted-yes-6A5ACD?style=for-the-badge">
   <img alt="Docker" src="https://img.shields.io/badge/docker-compose-2496ED?logo=docker&logoColor=white&style=for-the-badge">
@@ -28,9 +32,10 @@ listening data stay on your own machine.
 JLTamp does not provide, host, or distribute any music. It only plays media from
 **your** server, using **your own** files.
 
-**Get the app:** [JLTamp on Google Play](https://play.google.com/store/apps/details?id=com.jltamp.app).
-Point it at your server and you're done. The web player is bundled with this
-repo, so a browser works without installing anything.
+**Get the app:** [Google Play](https://play.google.com/store/apps/details?id=com.jltamp.app)
+(Android) or the [App Store](https://apps.apple.com/app/id6807401608) (iPhone and
+iPad, iOS 16.4+). Point it at your server and you're done. The web player is
+bundled with this repo, so a browser works without installing anything.
 
 
 ---
@@ -89,14 +94,14 @@ someone queues shows who added it for as long as it is still waiting.
 
 ### In the car
 
-Full **Android Auto** support: browse your libraries, playlists, liked songs and
-queue from the car screen, with a like button right in the car UI. Skip, pause
-and seek work from the steering wheel, a Bluetooth headset, a smartwatch or the
-lock screen — anything that speaks AVRCP.
+Full **Android Auto** and **CarPlay** support: browse your libraries, playlists,
+liked songs and queue from the car screen, with a like button right in the car
+UI. Skip, pause and seek work from the steering wheel, a Bluetooth headset, a
+smartwatch or the lock screen — anything that drives the system media controls.
 
-Music pauses when you leave the car and resumes when you get back in, and JLTamp
-publishes exactly one media session so you never get two players fighting over
-your lock screen.
+On Android, music pauses when you leave the car and resumes when you get back
+in. On both platforms JLTamp publishes exactly one media session, so you never
+get two players fighting over your lock screen.
 
 ### Around the house
 
@@ -155,7 +160,7 @@ adapts to phones, tablets and desktop.
 - 🖼️ Automatic album art & artist images (fetched from public music databases)
 - 📥 Rebuild a playlist from a shared link by matching its track list to your own files
 - 🚀 **Set up in the browser** — first‑run wizard creates your admin account
-- 📱 Works with the **JLTamp app** (Android + web)
+- 📱 Works with the **JLTamp app** (Android, iOS + web)
 - 🔒 Passwords hashed, per‑user tokens, music mounted **read‑only**
 
 ---
@@ -237,9 +242,11 @@ work. Mounting on the host is the reliable path either way.
 
 ## Connecting the app
 
-Download the **JLTamp** app, choose *“Connect your own server”*, and enter your
-server’s address (e.g. `http://192.168.1.10:32400` on your LAN, or your public
-HTTPS URL if you expose it). Sign in with your account.
+Download the **JLTamp** app — [Google Play](https://play.google.com/store/apps/details?id=com.jltamp.app)
+or the [App Store](https://apps.apple.com/app/id6807401608) — choose
+*“Connect your own server”*, and enter your server’s address (e.g.
+`http://192.168.1.10:32400` on your LAN, or your public HTTPS URL if you expose
+it). Sign in with your account.
 
 > The JLTamp app can also connect to a **Plex** server, if you already run one.
 
