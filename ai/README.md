@@ -47,7 +47,7 @@ Dat start llama.cpp op `:3100` en daarna de AI-dienst op `:5000`. Bij de eerste
 start indexeert hij je hele bibliotheek — de dienst is meteen bruikbaar en vult
 de rest op de achtergrond aan.
 
-Gemeten op de Xavier met 69.467 tracks:
+Gemeten op een Jetson Xavier met een bibliotheek van tienduizenden tracks:
 
 | | |
 |---|---|
@@ -65,7 +65,7 @@ curl -s localhost:5000/health | python3 -m json.tool
 In `/health` telt `features` de tracks die werkelijk een gemeten tempo hebben,
 en `feature_entries` de regels in het cachebestand. Die twee lopen uiteen met
 alles wat het bestand nog weet over muziek die niet meer in de bibliotheek
-staat — 63.102 tegen 69.467 hier.
+staat; die twee getallen lopen daardoor uiteen.
 
 **Logs staan in de journal**, niet in `logs/engine.log`. Dat bestand wordt
 alleen gevuld door `scripts/engine.sh`; onder systemd schrijft de dienst naar
@@ -177,15 +177,15 @@ daarvan — met een lock, zodat een lange nacht niet de volgende inhaalt:
 ```
 
 Streamen kost ~2,9 s per nummer tegen ~0,6 s lokaal, dus de eerste nacht loopt
-de achterstand weg (~9 uur voor 11.800 nummers) en daarna is er per keer nog
+de achterstand in een nacht weg, en daarna is er per keer nog
 maar een handjevol nieuwe tracks te meten. Het script weigert te draaien als
 het de muziek nergens kan bereiken — een lege mount ziet het als ontbrekend,
 want anders lijkt "niets te doen" op succes.
 
-Zonder zo'n schema groeit het gat vanzelf: van de 74.950 tracks hebben er
-63.102 een gemeten tempo. Die ~11.800 overige nummers kunnen niet op een
+Zonder zo'n schema groeit het gat vanzelf: een deel van je bibliotheek
+houdt dan geen gemeten tempo. Die nummers kunnen niet op een
 afbouw-curve staan (geen tempo, geen curve) en krijgen geen audio-boost bij
-"gym" of "slapen". Het featurebestand telt er meer (69.467), maar een deel
+"gym" of "slapen". Het featurebestand telt er meestal meer, maar een deel
 daarvan hoort bij tracks die niet meer in de bibliotheek zitten — `tests/
 benchmark_context.py` drukt het werkelijke aantal af.
 

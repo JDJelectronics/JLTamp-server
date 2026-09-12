@@ -286,8 +286,8 @@ class TrackLyrics(Base):
 
     Display already works without this: /lyrics/{id} reads the sidecar or the
     embedded tag per track, on demand. But "which song has this line in it"
-    cannot be answered one file at a time — a tag read per track over NFS, every
-    query, is not a search, so the text has to sit in the database.
+    cannot be answered one file at a time — tens of thousands of tag reads over NFS per query is
+    not a search, so the text has to sit in the database.
 
     Only LOCAL sources are indexed (`.lrc`/`.txt` next to the file, or the
     embedded tag). Anything fetched online is displayed but never written here:
@@ -314,6 +314,38 @@ class TrackLyrics(Base):
     found: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
 
+class MissedSearch(Base):
+    """Zoekopdrachten die niets opleverden — het verlanglijstje van een gebruiker.
+
+    Waarom dit bestaat: je merkt pas dat er iets ontbreekt op het moment dat je
+    het zoekt, en precies dan ben je het een minuut later weer vergeten. Deze
+    tabel onthoudt het.
+
+    Twee dingen die de lijst bruikbaar houden in plaats van een berg ruis:
+
+      * Zoeken gebeurt bij élke toetsaanslag, dus "b", "bo", "boh" komen alle
+        drie langs. Bij het opslaan wordt daarom eerst gekeken of er van deze
+        gebruiker al kort geleden een regel staat waarvan de ene tekst het begin
+        van de andere is; die wordt dan bijgewerkt naar de langste in plaats van
+        er een nieuwe naast te zetten.
+
+      * De lijst wordt bij het uitlezen opnieuw tegen de bibliotheek gehouden.
+        Staat het nummer er inmiddels in, dan verdwijnt de regel vanzelf — er is
+        geen knop om iets af te vinken en dus ook niets om te vergeten.
+    """
+    __tablename__ = "missed_searches"
+    __table_args__ = (UniqueConstraint("user_id", "query_norm", name="uq_user_missed_query"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    # Zoals de gebruiker het typte — dat is wat er in de lijst hoort te staan.
+    query: Mapped[str] = mapped_column(String(200))
+    # Kleine letters, ingekort; alleen om dubbele regels te herkennen.
+    query_norm: Mapped[str] = mapped_column(String(200), index=True)
+    hits: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[int] = mapped_column(Integer, default=0)
+    last_at: Mapped[int] = mapped_column(Integer, default=0, index=True)
+
+
 class ScanDir(Base):
     """Per-directory mtime, so a quick scan can skip folders that cannot contain
     anything new.
@@ -324,7 +356,7 @@ class ScanDir(Base):
     scan will not notice a retag; that is what a full scan is for.
 
     Why this exists: deciding "nothing changed" used to cost one stat() per FILE.
-    On the real library (78k files over NFS) that alone took ~290s on every scan.
+    On a large library (tens of thousands of files over NFS) that alone took ~290s on every scan.
     Checking ~2k directory mtimes instead takes ~1.5s.
 
     Lives in the writable data dir with the rest of the DB — never on the

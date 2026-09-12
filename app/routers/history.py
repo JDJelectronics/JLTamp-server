@@ -82,14 +82,19 @@ def _state(db, user_id: int, track_id: int) -> UserTrackState:
 # Who is listening to what, right now — Plex's /status/sessions. Kept in memory
 # on purpose: it is live state, worthless after a restart, and writing a row per
 # heartbeat would hammer SQLite for nothing.
-SESSION_TTL = 90  # a client heartbeats every 10s; 90s without one = gone
+# Een client klopt elke vijf seconden aan; vijfentwintig seconden stilte is dus
+# ruim vier gemiste hartslagen — dan speelt daar niets meer. Dit stond op
+# negentig, uit de tijd dat de hartslag om de tien seconden kwam, en dat is
+# precies het spook dat je zag: de muziek was al lang uit en de kaart bleef nog
+# anderhalve minuut staan.
+SESSION_TTL = 25
 _SESSIONS: dict[tuple[int, str], dict] = {}
 
 
 # Hoe lang een "playing" zonder voortgang nog geloofd wordt. Ruim boven een
 # bufferhikje, ruim onder SESSION_TTL, zodat een vastgelopen client vanzelf
 # uit /status/presence valt in plaats van er dagen te blijven staan.
-STALL_GRACE = 25
+STALL_GRACE = 12
 
 
 # Per sessie: (positie, wanneer die positie voor het laatst veranderde).
@@ -134,6 +139,22 @@ def _touch_session(user: User, session_id: str, track_id: int, state: str,
         "device": device or "JLTamp",
         "updated_at": time.time(),
     }
+
+    # Eén regel per toestel, niet één per nummer.
+    #
+    # De app maakt bij elk nieuw nummer een nieuwe sessie-id aan. Zonder dit
+    # bleef de vorige hier staan — met de oude titel, en nog steeds als
+    # "speelt", want hij verloopt pas na SESSION_TTL. In de lijst hieronder won
+    # die oude het van de nieuwe, en dus bleef er een nummer staan dat allang
+    # voorbij was. Zodra hetzelfde toestel zich onder een nieuwe sessie meldt,
+    # zijn zijn oudere sessies geschiedenis.
+    mijn_toestel = device or "JLTamp"
+    for k, v in list(_SESSIONS.items()):
+        if k == key:
+            continue
+        if v["user_id"] == user.id and (v.get("device") or "JLTamp") == mijn_toestel:
+            _SESSIONS.pop(k, None)
+            _LAST_MOVE.pop(k, None)
 
 
 # The open history row per (user, session). Deliberately NOT stored inside
@@ -293,7 +314,10 @@ def presence(user: User = Depends(require_user)):
     try:
         people = {u.id: u for u in db.execute(select(User)).scalars()}
         seen: dict[int, dict] = {}
-        for s in live:
+        # Nieuwste eerst. Stond er niet, en dan won bij twee regels van dezelfde
+        # persoon degene die toevallig het eerst was aangemaakt — de oudste dus,
+        # met het nummer van daarvoor.
+        for s in sorted(live, key=lambda r: -r.get("updated_at", 0)):
             u = people.get(s["user_id"])
             if not u:
                 continue
@@ -318,6 +342,11 @@ def presence(user: User = Depends(require_user)):
                 "state": s["state"],
                 "isMe": mine,
                 "share": share,
+                # Wélk toestel. Er staat één regel per persoon, maar met twee
+                # toestellen in huis is "the owner is listening" de helft van het
+                # antwoord: je wilt weten of dat de telefoon in de keuken is of
+                # de tablet in de woonkamer.
+                "device": s.get("device") or None,
             }
             # The track rides along ONLY for someone who chose "track" — not
             # even for yourself. Your own entry is filtered out by the UI

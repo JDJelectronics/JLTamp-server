@@ -247,7 +247,7 @@ def main() -> int:
     # ~80 s JIT warm-up, which a long-lived pool amortises away.
     ctx = multiprocessing.get_context("spawn")
 
-    # Submitting all 69k jobs at once fills the executor's queues and makes a
+    # Submitting every job at once fills the executor's queues and makes a
     # single dying worker take the whole run with it (BrokenProcessPool). Keep
     # only a small window in flight, and rebuild the pool if it does break so
     # one bad file costs a batch rather than the entire job.

@@ -352,6 +352,12 @@ def hub_search(query: str = Query(""), user: User = Depends(require_user),
             {"type": "artist", "Metadata": [artist_dict(a) for a in artists]},
             {"type": "album", "Metadata": [album_dict(a) for a in albums]},
         ]
+        # Niets gevonden? Dan onthouden we waar naar gezocht werd, zodat de
+        # eigenaar later ziet wat er in de collectie ontbreekt. Zie wishlist.py
+        # voor het samenvoegen van half getypte zoekopdrachten.
+        if not any(h["Metadata"] for h in hubs):
+            from .wishlist import noteer_misser
+            noteer_misser(db, user.id, query)
         return {"MediaContainer": {"size": len(hubs), "Hub": hubs}}
     finally:
         db.close()

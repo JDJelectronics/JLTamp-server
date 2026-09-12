@@ -492,7 +492,7 @@ class Engine:
         """{lowercase artist name: the name as written}.
 
         Built once per library refresh rather than per prompt: the old scan
-        lowercased 75k artist fields on every single request. Compilation
+        lowercased tens of thousands of artist fields on every single request. Compilation
         placeholders are left out — "various artists" is not an artist — and
         the performer credited on a compilation is included, so "de beste van
         Doe Maar" finds them even though the album says otherwise.
@@ -534,7 +534,7 @@ class Engine:
                 tail = re.sub(r"[^\w\s].*$", "", tail).strip()
                 if tail in index:
                     return index[tail]
-        # Substring first (cheap over 30k names), then the strict check on the
+        # Substring first (cheap over tens of thousands of names), then the strict check on the
         # handful that survive.
         hits = sorted((n for n in index if n in prompt), key=len, reverse=True)
         for name in hits:
@@ -1007,7 +1007,7 @@ class Engine:
         # shows no progress at all. `stale` is what is actually left to do.
         #
         # Read from a counter the embed worker maintains — never recomputed
-        # here. Hashing 69k track texts on every request made /health take
+        # here. Hashing every track text on each request made /health take
         # about a second, and polling it backed the whole server up behind a
         # 17-deep queue.
         stale = self._stale_count

@@ -100,7 +100,7 @@ def _reset_new() -> None:
         _scan_mail["album_sample"] = []
 
 
-def _note_new_album(library_id: int, artist: str, title: str, year) -> None:
+def _note_new_album(library_id: int, album_id: int, artist: str, title: str, year) -> None:
     with _scan_lock:
         _scan_state["new_album_count"] += 1
         lst = _scan_state["new_albums"]
@@ -110,7 +110,8 @@ def _note_new_album(library_id: int, artist: str, title: str, year) -> None:
         _scan_mail["albums_by_lib"][library_id] = _scan_mail["albums_by_lib"].get(library_id, 0) + 1
         if len(_scan_mail["album_sample"]) < _MAIL_SAMPLE_MAX:
             _scan_mail["album_sample"].append(
-                {"library_id": library_id, "artist": artist, "title": title, "year": year})
+                {"library_id": library_id, "album_id": album_id,
+                 "artist": artist, "title": title, "year": year})
 
 
 def _note_new_track(library_id: int, artist: str, title: str, album: str) -> None:
@@ -134,12 +135,22 @@ def send_new_music_digest() -> None:
     with _scan_lock:
         albums_by_lib = dict(_scan_mail["albums_by_lib"])
         tracks_by_lib = dict(_scan_mail["tracks_by_lib"])
-        sample = list(_scan_mail["album_sample"])
+        sample = [dict(a) for a in _scan_mail["album_sample"]]
     if sum(tracks_by_lib.values()) <= 0:
         return
 
     db = SessionLocal()
     try:
+        # De hoezen pas nú opzoeken, niet bij het noteren: de verrijking draait
+        # tussen scan en digest in en vult dan de online hoes voor albums die
+        # zelf geen cover hadden.
+        ids = [a["album_id"] for a in sample if a.get("album_id")]
+        if ids:
+            art = {aid: (p or op) for aid, p, op in db.execute(
+                select(Album.id, Album.art_path, Album.online_art_path)
+                .where(Album.id.in_(ids))).all()}
+            for a in sample:
+                a["art_path"] = art.get(a.get("album_id"))
         users = db.execute(select(User).where(
             User.is_active == True, User.notify_new_music == True)).scalars().all()  # noqa: E712
         for u in users:
@@ -322,8 +333,8 @@ def _resolve_album_art(album_id: int, sample_track: Path) -> str | None:
 # side. The brackets are what distinguish it from a real album that happens to be
 # called "Singles" (those exist), so the folder cover is only overridden when the
 # name is bracketed. Generic on purpose — the public repo shares this code.
-# Verified against a real library: matches exactly the same tracks as the
-# old hardcoded, Dutch-only folder-name check.
+# Verified against the live library: matches exactly the same tracks as the
+# old hardcoded "[singles & losse nummers]" check.
 _SINGLES_DIR_RE = re.compile(r"[/\\]\[[^/\\]*singles[^/\\]*\][/\\]", re.IGNORECASE)
 
 
@@ -482,13 +493,13 @@ def scan_library(library_id: int, full: bool = False, keep_new: bool = False) ->
                 al.art_path = _resolve_album_art(al.id, sample)
                 if al.art_path and not artist.art_path:
                     artist.art_path = al.art_path
-                _note_new_album(library_id, artist.name, title, year)
+                _note_new_album(library_id, al.id, artist.name, title, year)
             album_cache[key] = al
             return al
 
         # ── Quick-scan bookkeeping: per-directory mtimes ──────────────────
         # Deciding "nothing changed" used to cost a stat() per FILE. On the real
-        # library that is 78k stats over NFS — ~290s on EVERY scan, even when
+        # library that is tens of thousands of stats over NFS — ~290s on EVERY scan, even when
         # nothing was added. A directory's mtime already tells us whether an
         # entry was added, removed or renamed inside it, and checking ~2k of
         # those takes ~1.5s.

@@ -30,6 +30,10 @@ class AccessBody(BaseModel):
     library_ids: list[int]
 
 
+class NameBody(BaseModel):
+    name: str | None = None
+
+
 class FlagBody(BaseModel):
     value: bool
 
@@ -262,6 +266,29 @@ def set_active(user_id: int, body: FlagBody, admin: User = Depends(require_admin
         user.is_active = body.value
         db.commit()
         return {"ok": True}
+    finally:
+        db.close()
+
+
+@router.post("/admin/users/{user_id}/name")
+def set_display_name(user_id: int, body: NameBody, admin: User = Depends(require_admin)):
+    """De naam waarmee iemand in de app verschijnt.
+
+    Zonder dit stond er het e-mailadres: wie is uitgenodigd en nooit een naam
+    heeft ingevuld heet "someone@example.com" — in de deelnemerslijst van samen
+    luisteren, op de kaart "luistert nu ook", overal. Dat is geen naam maar een
+    adres, en de beheerder kon er niets aan doen.
+    """
+    naam = (body.name or "").strip()[:60]
+    db = SessionLocal()
+    try:
+        user = db.get(User, user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="Brûker net fûn")
+        # Leeg maken mag: dan valt de app terug op het deel vóór de @.
+        user.display_name = naam or None
+        db.commit()
+        return {"ok": True, "displayName": user.display_name}
     finally:
         db.close()
 

@@ -35,11 +35,30 @@ def _now_ms() -> int:
 
 @dataclass
 class Participant:
+    """Eén VERBINDING, niet één persoon.
+
+    Dit was `user_id → Participant`, en dat werkt precies zolang iedereen op één
+    toestel zit. Doet iemand mee vanaf zijn telefoon én zijn tablet — of test
+    iemand met twee eigen toestellen — dan schreef de tweede verbinding de
+    eerste domweg over: de eerste bleef open maar stond niet meer in de lijst,
+    dus kreeg niets meer door. En omdat de host aan een gebruiker hing in plaats
+    van aan een verbinding, kreeg dat tweede toestel ook nog eens "jij bent de
+    host" te horen. Twee hosts, geen gast, niemand die iemand volgt: dat is het
+    "hij doet niks" dat van buiten niet te verklaren was.
+
+    Vandaar een eigen sleutel per verbinding. De gebruiker staat er nog steeds
+    bij — voor de naam, de foto en het doorgeven van het hostschap — maar het
+    ROUTEREN gaat per verbinding.
+    """
+    conn_id: str
     user_id: int
     name: str
     thumb: str | None
     ws: WebSocket
     is_host: bool = False
+    # Welk toestel dit is ("Pixel 9", "iPhone", "SM-X205"). Alleen nodig om twee
+    # verbindingen van dezelfde persoon uit elkaar te houden.
+    device: str | None = None
 
 
 @dataclass
@@ -53,7 +72,10 @@ class Session:
     anchor_ts: int = 0             # server time (ms) the position was captured / scheduled-start
     is_playing: bool = False
     queue: list = field(default_factory=list)
-    participants: dict[int, Participant] = field(default_factory=dict)  # user_id → Participant
+    participants: dict[str, Participant] = field(default_factory=dict)  # conn_id → Participant
+    # De verbinding die de baas is. Blijft leeg tot de eerste verbinding van de
+    # gebruiker die de sessie aanmaakte binnenkomt; zie de websocket hieronder.
+    host_conn_id: str | None = None
 
     def effective_position(self) -> int:
         """Where a late joiner should be RIGHT NOW. anchor_ts may be in the
@@ -92,24 +114,28 @@ MANAGER = SessionManager()
 
 
 def _participants_payload(s: Session) -> list:
+    # `id` is de verbinding, `userId` de persoon. Twee toestellen van dezelfde
+    # persoon geven twee regels met hetzelfde userId — daarom heeft de client
+    # `id` nodig als sleutel.
     return [
-        {"userId": p.user_id, "name": p.name, "thumb": p.thumb, "isHost": p.is_host}
+        {"id": p.conn_id, "userId": p.user_id, "name": p.name, "thumb": p.thumb,
+         "isHost": p.is_host, "device": p.device}
         for p in s.participants.values()
     ]
 
 
-async def _broadcast(s: Session, msg: dict, exclude: int | None = None) -> None:
+async def _broadcast(s: Session, msg: dict, exclude: str | None = None) -> None:
     data = json.dumps(msg)
-    dead: list[int] = []
-    for uid, p in list(s.participants.items()):
-        if uid == exclude:
+    dead: list[str] = []
+    for cid, p in list(s.participants.items()):
+        if cid == exclude:
             continue
         try:
             await p.ws.send_text(data)
         except Exception:
-            dead.append(uid)
-    for uid in dead:
-        s.participants.pop(uid, None)
+            dead.append(cid)
+    for cid in dead:
+        s.participants.pop(cid, None)
 
 
 # ── REST ────────────────────────────────────────────────────────────────────
@@ -160,9 +186,18 @@ async def session_ws(websocket: WebSocket, code: str):
     # Listen Together participant showed a broken avatar. The presence handler
     # below always built a proper URL; this one was simply missed.
     thumb = user_thumb_ref(user)
-    is_host = user.id == s.host_user_id
-    s.participants[user.id] = Participant(
-        user_id=user.id, name=name, thumb=thumb, ws=websocket, is_host=is_host
+    conn_id = secrets.token_hex(8)
+    device = (websocket.query_params.get("device") or "").strip()[:40] or None
+    # De eerste verbinding van de gebruiker die de sessie aanmaakte wordt de
+    # host-verbinding. Komt diezelfde persoon later nog eens binnen (tweede
+    # toestel), dan is dat gewoon een luisteraar erbij — niet opeens een tweede
+    # host die de eerste overschrijft.
+    if s.host_conn_id is None and user.id == s.host_user_id:
+        s.host_conn_id = conn_id
+    is_host = conn_id == s.host_conn_id
+    s.participants[conn_id] = Participant(
+        conn_id=conn_id, user_id=user.id, name=name, thumb=thumb, ws=websocket,
+        is_host=is_host, device=device,
     )
 
     # 1. Hand the newcomer the current authoritative state so they sync instantly.
@@ -177,6 +212,11 @@ async def session_ws(websocket: WebSocket, code: str):
             "hostUserId": s.host_user_id,
             "youAreHost": is_host,
             "youId": user.id,
+            # De eigen VERBINDING. Zit dezelfde persoon op twee toestellen, dan
+            # is het account geen antwoord meer op "ben ik de host" — de client
+            # vergeleek daarop en dan riepen beide toestellen zichzelf uit.
+            "youConnId": conn_id,
+            "hostConnId": s.host_conn_id,
             "participants": _participants_payload(s),
         }))
     except Exception:
@@ -196,7 +236,7 @@ async def session_ws(websocket: WebSocket, code: str):
             # Recomputed every message, never trusted from connect time: after a
             # promotion or a handover the old flag lies, and it is what gates
             # transport authority.
-            is_host = user.id == s.host_user_id
+            is_host = conn_id == s.host_conn_id
 
             # Clock sync — reply immediately with server time.
             if t == "ping":
@@ -209,7 +249,7 @@ async def session_ws(websocket: WebSocket, code: str):
             if t == "queueAdd" and msg.get("track") is not None:
                 track = msg["track"]
                 # Stamp who added it. The clients show this for as long as the
-                # track is still queued, so "<name> added X" stays on screen
+                # track is still queued, so "the owner added X" stays on screen
                 # until it actually plays instead of flashing past in a toast.
                 if isinstance(track, dict):
                     track = {**track, "addedBy": name, "addedById": user.id}
@@ -237,16 +277,49 @@ async def session_ws(websocket: WebSocket, code: str):
                     target = int(msg.get("userId") or 0)
                 except (TypeError, ValueError):
                     continue
-                if target == s.host_user_id or target not in s.participants:
+                # Zoek een VERBINDING van die persoon. Zit hij op twee toestellen,
+                # dan wordt de langst aanwezige de host — dat is de verbinding die
+                # er als eerste was, en de volgorde van de lijst houdt dat vast.
+                doel = next((q for q in s.participants.values() if q.user_id == target), None)
+                if doel is None or doel.conn_id == s.host_conn_id:
                     continue
                 for q in s.participants.values():
-                    q.is_host = (q.user_id == target)
+                    q.is_host = (q.conn_id == doel.conn_id)
                 s.host_user_id = target
+                s.host_conn_id = doel.conn_id
                 await _broadcast(s, {
                     "t": "host", "hostUserId": target,
+                    "hostConnId": s.host_conn_id,
                     "participants": _participants_payload(s),
                 })
                 continue
+
+            # De host stopt ermee — en dan stoppen we met z'n allen.
+            #
+            # Tot nu toe was weggaan altijd "weggaan": ging de host eruit, dan
+            # promoveerde de server de langst aanwezige luisteraar en liep de
+            # sessie door. Voor een host die de verbinding verliest is dat precies
+            # goed, maar voor een host die op "sessie beëindigen" tikt niet: de
+            # gast bleef achter in een sessie die niemand meer bedoelde, en moest
+            # zelf nog een keer op weg-drukken.
+            if t == "end":
+                if not is_host:
+                    continue
+                await _broadcast(s, {"t": "ended"}, exclude=conn_id)
+                for q in list(s.participants.values()):
+                    if q.conn_id == conn_id:
+                        continue
+                    try:
+                        await q.ws.close(code=4000)
+                    except Exception:
+                        pass
+                s.participants.clear()
+                MANAGER.remove(code)
+                try:
+                    await websocket.close(code=4000)
+                except Exception:
+                    pass
+                return
 
             if t == "reaction":
                 text = " ".join(str(msg.get("emoji", "")).split())[:140]
@@ -280,7 +353,7 @@ async def session_ws(websocket: WebSocket, code: str):
                     "positionMs": s.position_ms, "isPlaying": s.is_playing,
                     "startAtServerTs": s.anchor_ts,
                     "serverTs": _now_ms(),
-                }, exclude=user.id)
+                }, exclude=conn_id)
             elif t == "play":
                 s.position_ms = int(msg.get("positionMs", s.effective_position()))
                 s.is_playing = True
@@ -288,13 +361,13 @@ async def session_ws(websocket: WebSocket, code: str):
                 await _broadcast(s, {
                     "t": "play", "positionMs": s.position_ms,
                     "startAtServerTs": s.anchor_ts, "serverTs": _now_ms(),
-                }, exclude=user.id)
+                }, exclude=conn_id)
             elif t == "pause":
                 s.position_ms = int(msg.get("positionMs", s.effective_position()))
                 s.is_playing = False
                 s.anchor_ts = _now_ms()
                 await _broadcast(s, {"t": "pause", "positionMs": s.position_ms, "serverTs": _now_ms()},
-                                 exclude=user.id)
+                                 exclude=conn_id)
             elif t == "seek":
                 s.position_ms = int(msg.get("positionMs", 0))
                 s.is_playing = bool(msg.get("isPlaying", s.is_playing))
@@ -302,7 +375,7 @@ async def session_ws(websocket: WebSocket, code: str):
                 await _broadcast(s, {
                     "t": "seek", "positionMs": s.position_ms, "isPlaying": s.is_playing,
                     "startAtServerTs": s.anchor_ts if s.is_playing else 0, "serverTs": _now_ms(),
-                }, exclude=user.id)
+                }, exclude=conn_id)
             elif t == "sync":
                 # Host heartbeat: its TRUE current position, anchored to NOW (no
                 # scheduled start), so guests continuously track steady-state
@@ -313,7 +386,7 @@ async def session_ws(websocket: WebSocket, code: str):
                 await _broadcast(s, {
                     "t": "sync", "positionMs": s.position_ms,
                     "isPlaying": s.is_playing, "serverTs": _now_ms(),
-                }, exclude=user.id)
+                }, exclude=conn_id)
             elif t == "queue":
                 s.queue = msg.get("queue", [])
                 await _broadcast(s, {"t": "queue", "queue": s.queue})
@@ -327,12 +400,13 @@ async def session_ws(websocket: WebSocket, code: str):
         # this ghost's finally runs; without this guard we'd pop the freshly
         # reconnected participant (silent desync / wrong host-migration / room
         # teardown). If a newer socket owns the slot, leave everything alone.
-        cur = s.participants.get(user.id)
+        cur = s.participants.get(conn_id)
         if cur is not None and cur.ws is websocket:
             # Was this the host at the moment they left? (They may have been promoted
-            # to host mid-session, so check the live host id, not the join-time flag.)
-            was_host = (user.id == s.host_user_id)
-            s.participants.pop(user.id, None)
+            # to host mid-session, so check the live host connection, not the
+            # join-time flag.)
+            was_host = (conn_id == s.host_conn_id)
+            s.participants.pop(conn_id, None)
             if not s.participants:
                 # Empty room → tear the session down.
                 MANAGER.remove(code)
@@ -341,9 +415,11 @@ async def session_ws(websocket: WebSocket, code: str):
                 # (dict preserves insertion order) instead of ending the session.
                 new_host = next(iter(s.participants.values()))
                 s.host_user_id = new_host.user_id
+                s.host_conn_id = new_host.conn_id
                 new_host.is_host = True
                 await _broadcast(s, {
                     "t": "host", "hostUserId": new_host.user_id,
+                    "hostConnId": new_host.conn_id,
                     "participants": _participants_payload(s),
                 })
             else:
@@ -361,17 +437,27 @@ presence_router = APIRouter(prefix="/presence", tags=["presence"])
 
 @dataclass
 class Peer:
+    """Eén AANWEZIG TOESTEL, niet één persoon.
+
+    Zelfde verhaal als bij de deelnemers van een sessie: dit hing aan een
+    gebruiker, dus je telefoon en je tablet schreven elkaar over. Wie jou wilde
+    uitnodigen bereikte dan alleen het toestel dat zich het laatst meldde, en in
+    de lijst "mensen op je netwerk" stond je maar één keer — terwijl je op twee
+    plekken zat.
+    """
+    conn_id: str
     user_id: int
     name: str
     thumb: str | None
     net: str
     ws: WebSocket
     session_code: str | None = None
+    device: str | None = None
 
 
 class PresenceManager:
     def __init__(self) -> None:
-        self.peers: dict[int, Peer] = {}   # user_id → Peer (one presence per user)
+        self.peers: dict[str, Peer] = {}   # conn_id → Peer (één per TOESTEL)
 
     @staticmethod
     def net_of(ip: str) -> str:
@@ -396,12 +482,15 @@ def _presence_client_ip(ws: WebSocket) -> str:
     return ws.client.host if ws.client else ""
 
 
-def _peer_list(net: str, exclude: int | None = None) -> list:
+def _peer_list(net: str, exclude: str | None = None) -> list:
+    # `id` is het toestel, `userId` de persoon. Zit iemand op twee toestellen,
+    # dan staan er twee regels met hetzelfde userId — de client zet het toestel
+    # eronder zodat je ze uit elkaar houdt.
     return [
-        {"userId": p.user_id, "name": p.name, "thumb": p.thumb,
-         "inSession": p.session_code is not None}
+        {"id": p.conn_id, "userId": p.user_id, "name": p.name, "thumb": p.thumb,
+         "device": p.device, "inSession": p.session_code is not None}
         for p in PRESENCE.peers.values()
-        if p.net == net and p.user_id != exclude
+        if p.net == net and p.conn_id != exclude
     ]
 
 
@@ -411,7 +500,7 @@ async def _presence_push_lists(net: str) -> None:
     for p in list(PRESENCE.peers.values()):
         if p.net == net:
             try:
-                await p.ws.send_text(json.dumps({"t": "peers", "peers": _peer_list(net, exclude=p.user_id)}))
+                await p.ws.send_text(json.dumps({"t": "peers", "peers": _peer_list(net, exclude=p.conn_id)}))
             except Exception:
                 pass
 
@@ -432,7 +521,12 @@ async def presence_ws(websocket: WebSocket):
         or f"User {user.id}"
     )
     thumb = user_thumb_ref(user)
-    PRESENCE.peers[user.id] = Peer(user_id=user.id, name=name, thumb=thumb, net=net, ws=websocket)
+    conn_id = secrets.token_hex(8)
+    device = (websocket.query_params.get("device") or "").strip()[:40] or None
+    PRESENCE.peers[conn_id] = Peer(
+        conn_id=conn_id, user_id=user.id, name=name, thumb=thumb, net=net,
+        ws=websocket, device=device,
+    )
 
     # Refresh everyone on this network (incl. the newcomer) with their own list.
     await _presence_push_lists(net)
@@ -453,7 +547,7 @@ async def presence_ws(websocket: WebSocket):
             # Advertise which session (if any) this user is hosting/in, so peers
             # see who's already listening.
             if t == "setSession":
-                p = PRESENCE.peers.get(user.id)
+                p = PRESENCE.peers.get(conn_id)
                 if p:
                     p.session_code = (msg.get("code") or None)
                     await _presence_push_lists(net)
@@ -462,9 +556,23 @@ async def presence_ws(websocket: WebSocket):
             # Direct invite: relay a code to a peer ON THE SAME NETWORK. `kind`
             # says whether it's a Listen Together session or a shared playlist.
             if t == "invite":
-                target = PRESENCE.peers.get(msg.get("toUserId"))
+                # Bij voorkeur naar het TOESTEL dat is aangetikt; kent de client
+                # dat nog niet (oudere versie), dan naar elk toestel van die
+                # persoon — beter twee keer gevraagd dan niemand bereikt.
+                doelen: list[Peer] = []
+                gekozen = PRESENCE.peers.get(msg.get("toId") or "")
+                if gekozen is not None:
+                    doelen = [gekozen]
+                else:
+                    try:
+                        wie = int(msg.get("toUserId") or 0)
+                    except (TypeError, ValueError):
+                        wie = 0
+                    doelen = [q for q in PRESENCE.peers.values() if q.user_id == wie]
                 code = msg.get("code")
-                if target and target.net == net and code:
+                for target in doelen:
+                    if not (target.net == net and code):
+                        continue
                     try:
                         await target.ws.send_text(json.dumps({
                             "t": "invited", "fromUserId": user.id,
@@ -483,7 +591,7 @@ async def presence_ws(websocket: WebSocket):
         # Same reconnect guard as session_ws: only evict if the roster still points
         # at THIS socket, so a reconnect (which re-registers first) isn't removed by
         # the ghost's finally.
-        cur = PRESENCE.peers.get(user.id)
+        cur = PRESENCE.peers.get(conn_id)
         if cur is not None and cur.ws is websocket:
-            PRESENCE.peers.pop(user.id, None)
+            PRESENCE.peers.pop(conn_id, None)
             await _presence_push_lists(net)
