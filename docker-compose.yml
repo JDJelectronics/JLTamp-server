@@ -1,0 +1,39 @@
+services:
+  jltamp-server:
+    # Ready-made image for amd64 and arm64 (PC, NAS, Raspberry Pi, Apple silicon).
+    # To build from this checkout instead, replace the image line with `build: .`
+    image: ghcr.io/jltelectronics/jltamp-server:latest
+    container_name: jltamp-server
+    restart: unless-stopped
+    ports:
+      # host:container — 32400 mirrors Plex's default so nothing else changes.
+      - "32400:32400"
+    environment:
+      SERVER_NAME: "JLTamp"
+      RESCAN_INTERVAL_MIN: "0"
+      # First run: open http://localhost:32400 and CREATE YOUR ADMIN ACCOUNT in
+      # the browser — no password is baked in here. Optionally set a fallback/
+      # backup admin password instead of (or as well as) the web wizard:
+      # JLTAMP_PASSWORD: "a-strong-backup-password"
+      # JLTAMP_ADMIN_EMAIL: "you@example.com"
+      #
+      # The playlist importers are off unless you turn them on. Off means the
+      # endpoints answer 403 and the app hides the import cards, so nothing in
+      # the UI offers a feature this server will refuse.
+      # JLTAMP_IMPORTERS: "true"
+      #
+      # Optional Spotify Web API credentials for the playlist importer — create
+      # your own app at developer.spotify.com. Albums and tracks work with just
+      # these; playlists also need a one-time account link (Admin → Spotify).
+      # Can also be entered in Admin instead. The old names IMPORT_CLIENT_ID /
+      # IMPORT_CLIENT_SECRET still work.
+      # SPOTIFY_CLIENT_ID: ""
+      # SPOTIFY_CLIENT_SECRET: ""
+    volumes:
+      # ── EDIT THIS: point the left side at your music folder on the server ──
+      - /path/to/your/music:/music:ro
+      # Persistent server data (SQLite DB + artwork cache). Survives rebuilds.
+      - jltamp-data:/data
+
+volumes:
+  jltamp-data:

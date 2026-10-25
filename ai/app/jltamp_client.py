@@ -1,0 +1,735 @@
+"""Talks to the JLTamp server.
+
+This replaces the Plex coupling of the old engine. Everything the AI needs —
+the track list, listening history, likes, and playlist creation — comes from
+JLTamp's own API, so the playlists it builds land where the app can see them.
+
+Auth is a session token sent as `X-Plex-Token` (JLTamp kept Plex's header name).
+Supply `JLTAMP_TOKEN`, or an email/password pair that we exchange for one.
+"""
+from __future__ import annotations
+
+import os
+import re
+import threading
+import time
+import unicodedata
+from dataclasses import dataclass, field
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from . import config
+
+
+@dataclass
+class Track:
+    """The subset of a JLTamp track the scorer actually reads."""
+    rating_key: str            # "t123"
+    title: str
+    artist: str                # album/grouping artist
+    orig_artist: str           # the track's own artist, set on compilations
+    album: str
+    year: int | None
+    genre: str
+    duration_ms: int
+    play_count: int
+    last_played_at: int
+    rating: float
+    library_id: str = ""
+    path: str = ""
+    added_at: int = 0          # epoch-seconden; een volledige herscan zet dit opnieuw
+
+    # Derived listening signals, filled in by the engine (not by the API).
+    skips: int = 0
+    liked: bool = False
+    features: dict = field(default_factory=dict)
+    # A genre guessed from embedding neighbours when the real one is a
+    # placeholder. Kept SEPARATE from `genre` on purpose: it feeds matching and
+    # the genre boost, but must never enter the embedding text — a wrong guess
+    # baked into the vector made Dutch schlager literally contain the word
+    # "alternative" and match that query. Vectors are built from real data only.
+    inferred_genre: str = ""
+
+    # Placeholders a compilation uses where a real artist name would go.
+    _COMPILATION = {"various artists", "various", "va", "verschillende artiesten",
+                    "diverse artiesten", "soundtrack", "unknown artist", "unknown"}
+
+    @property
+    def real_artist(self) -> str:
+        """Who actually performs this — not the album's grouping artist.
+
+        On compilations `artist` is "Various Artists", which carries no musical
+        meaning at all. Embedded as-is, such tracks land near the middle of the
+        vector space and come back moderately similar to *every* prompt: they
+        surfaced under "slaapmuziek", "metal" and "focus" alike. JLTamp already
+        stores the performer in originalTitle for exactly this case.
+        """
+        if self.artist.strip().lower() in self._COMPILATION and self.orig_artist:
+            return self.orig_artist
+        return self.artist
+
+    @property
+    def clean_title(self) -> str:
+        """The title without the scanner's leftovers.
+
+        Some tags come through as "1 - The Weeknd - Blinding Lights": a track
+        number and the artist repeated inside the title. Embedded as-is, that
+        doubles the artist's weight and injects a meaningless number.
+        """
+        title = re.sub(r"^\s*\d+\s*[-.]\s*", "", self.title or "")
+        for name in (self.artist, self.orig_artist):
+            if name:
+                title = re.sub(rf"^{re.escape(name)}\s*-\s*", "", title,
+                               flags=re.IGNORECASE)
+        return title.strip() or (self.title or "")
+
+    # Alles tussen haakjes is een VERSIE van hetzelfde liedje: "(Live Version)",
+    # "(Sped Up)", "(Instrumental)", "(Taylor's Version)", "(Remastered 2011)".
+    # Eerst bleven live en akoestisch bewust apart, maar in een mix is dat
+    # gewoon hetzelfde nummer twee keer: "Messy", "Messy (Sped Up)" en "Messy
+    # (Live Version…)" stonden samen in één Voor nu. Alleen haakjes die een DEEL
+    # noemen blijven onderscheidend: "Intro (Part 2)" is een ander nummer.
+    _HAAKJES = re.compile(r"\s*[\(\[][^\)\]]*[\)\]]")
+    _DEEL = re.compile(r"\b(?:part|pt|deel|vol|chapter|hoofdstuk)\b\.?\s*\w*"
+                       r"|\b(?:nr|no)\.?\s*\d+", re.IGNORECASE)
+    _VERSIE_STREEP = re.compile(
+        r"\s+-\s+(?:\d{4}\s+)?(?:remaster(?:ed)?|radio\s+edit|single\s+version|"
+        r"album\s+version|mono|stereo|explicit|live|acoustic|akoestisch|"
+        r"instrumental|sped\s+up|slowed|demo|remix|edit|version|versie)\b.*$",
+        re.IGNORECASE)
+    _GAST = re.compile(r"\s+(?:feat\.?|ft\.?|featuring)\s+.*$", re.IGNORECASE)
+    _MEE_ARTIEST = re.compile(r"\s+(?:feat\.?|ft\.?|featuring|&|x|,)\s+.*$",
+                              re.IGNORECASE)
+
+    @staticmethod
+    def _plat(s: str) -> str:
+        """Kleine letters, zonder accenten en leestekens. Letters uit elk schrift
+        blijven staan: wie alles naar ASCII omzet, maakt van elke Japanse titel
+        een lege string, en dan zijn al die nummers ineens 'hetzelfde'."""
+        s = "".join(c for c in unicodedata.normalize("NFKD", s or "")
+                    if not unicodedata.combining(c))
+        return re.sub(r"[\W_]+", " ", s.lower()).strip()
+
+    @property
+    def song_key(self) -> tuple[str, str]:
+        """Welk LIEDJE dit is, los van op welke plaat het staat.
+
+        Hetzelfde nummer staat vaak twee of drie keer in de bibliotheek: op het
+        album, op een verzamelalbum ('Various Artists', met de echte artiest in
+        originalTitle) en als single — soms met '(Remastered 2011)' of
+        '- Radio Edit' erachter. Dat zijn verschillende tracks met verschillende
+        ids, dus een lijst die op id ontdubbelt zet ze allemaal neer. Dit is de
+        sleutel om op te ontdubbelen: de echte artiest (zonder gasten) en de
+        titel zonder versie-aanduiding.
+        """
+        title = self._HAAKJES.sub(
+            lambda m: m.group(0) if self._DEEL.search(m.group(0)) else "",
+            self.clean_title)
+        title = self._VERSIE_STREEP.sub("", title)
+        title = self._GAST.sub("", title)
+        # De artiest van het NUMMER, niet die van de map. real_artist kijkt
+        # alleen naar orig_artist als de map een bekende verzamelnaam heeft
+        # ("Various Artists"); maar een map als "Foute Uur Top 1500" is net zo
+        # goed een verzameling, en zo stond "Sometimes" van Britney Spears twee
+        # keer in één Ontdekking. real_artist zelf blijft zoals hij is: die zit
+        # in de embedding-tekst, en daaraan komen betekent alles opnieuw embedden.
+        artist = self._MEE_ARTIEST.sub("", self.orig_artist or self.real_artist or "")
+        return (self._plat(artist), self._plat(title) or self._plat(self.title))
+
+    @property
+    def text(self) -> str:
+        """What gets embedded. Genre carries most of the "what does this sound
+        like" signal; artist and title alone barely carry any.
+
+        The album is deliberately left out when the artist is a compilation
+        placeholder — "Radio Piepschuim" describes the CD, not the music.
+        """
+        artist = self.real_artist
+        bits = [artist, self.clean_title]
+        if self.genre:
+            bits.append(self.genre)
+        compilation = self.artist.strip().lower() in self._COMPILATION
+        if (self.album and not compilation
+                and self.album.lower() not in (self.title or "").lower()):
+            bits.append(self.album)
+        # Optioneel: verrijk met MEETBARE beschrijvers (geen giswerk) — tempo/
+        # energie uit de audio-analyse + het decennium uit het jaar, voor beter
+        # vibe-/era-zoeken. Uit tenzij AI_RICH_TEXT=1; aanzetten verandert ALLE
+        # embeddings, dus vereist een bewuste re-embed (~14 min).
+        if os.environ.get("AI_RICH_TEXT", "").lower() in ("1", "true", "yes"):
+            bits.extend(self._descriptors())
+        return " - ".join(b for b in bits if b)
+
+    def _descriptors(self) -> list[str]:
+        """Meetbare stijl-woorden: decennium + tempo/energie (indien geanalyseerd).
+        Alleen echte, gemeten data — nooit giswerk (dat corrumpeert de vector)."""
+        out: list[str] = []
+        if self.year:
+            out.append(f"{(self.year // 10) * 10}s")
+        bpm = self.features.get("bpm")
+        if bpm:
+            if bpm < 70:
+                out.append("langzaam slow")
+            elif bpm < 100:
+                out.append("midtempo relaxed")
+            elif bpm < 132:
+                out.append("upbeat energiek")
+            else:
+                out.append("snel uptempo driving")
+        energy = self.features.get("energy")
+        if isinstance(energy, (int, float)):
+            if energy < 0.15:
+                out.append("rustig kalm mellow")
+            elif energy > 0.38:
+                out.append("energiek krachtig")
+        return out
+
+    @property
+    def match_genre(self) -> str:
+        """The genre to match and score against: the real one, or the inferred
+        guess when the real one is missing/placeholder. NOT what gets embedded —
+        `text` uses only the real genre so a guess cannot corrupt the vector."""
+        return self.inferred_genre if self.inferred_genre else self.genre
+
+    @property
+    def haystack(self) -> str:
+        """Lowercased blob for keyword/exclusion matching."""
+        return (f"{self.artist} {self.orig_artist} {self.title} "
+                f"{self.album} {self.match_genre}").lower()
+
+
+class JLTampError(RuntimeError):
+    pass
+
+
+class JLTampClient:
+    def __init__(self, url: str | None = None, token: str | None = None):
+        self.url = (url or config.JLTAMP_URL).rstrip("/")
+        self._token = token or config.JLTAMP_TOKEN
+        self._lock = threading.Lock()
+        self.session = self._make_session()
+
+    @staticmethod
+    def _make_session() -> requests.Session:
+        s = requests.Session()
+        # Retry only idempotent reads; a retried playlist POST would duplicate
+        # it. A dead keep-alive socket the server closed while we were idle is a
+        # connection error, so retrying READ re-opens a fresh one rather than
+        # hanging on the read timeout — the weekly job sat idle between calls
+        # and paid a 60 s+ stall on the first stale socket without this.
+        retries = Retry(total=3, backoff_factor=0.5, connect=3, read=2,
+                        status_forcelist=[502, 503, 504],
+                        allowed_methods=["GET"])
+        adapter = HTTPAdapter(max_retries=retries)
+        s.mount("http://", adapter)
+        s.mount("https://", adapter)
+        return s
+
+    def refresh_connection(self) -> None:
+        """Drop pooled sockets and start fresh. Called before a batch job that
+        has been idle long enough for the server to have closed keep-alive."""
+        try:
+            self.session.close()
+        except Exception:                            # noqa: BLE001
+            pass
+        self.session = self._make_session()
+
+    # ── auth ─────────────────────────────────────────────────────────────────
+    def _headers(self) -> dict:
+        h = {"Accept": "application/json", "X-Plex-Product": "JLTamp AI"}
+        if self._token:
+            h["X-Plex-Token"] = self._token
+        return h
+
+    def login(self) -> str:
+        """Exchange email+password for a session token. No-op if we have one."""
+        if self._token:
+            return self._token
+        if not (config.JLTAMP_EMAIL and config.JLTAMP_PASSWORD):
+            raise JLTampError(
+                "No JLTAMP_TOKEN and no JLTAMP_EMAIL/JLTAMP_PASSWORD — cannot "
+                "authenticate to JLTamp. See .env.example."
+            )
+        r = self.session.post(
+            f"{self.url}/auth/login",
+            json={"email": config.JLTAMP_EMAIL, "password": config.JLTAMP_PASSWORD},
+            timeout=20,
+        )
+        if r.status_code == 401:
+            raise JLTampError("JLTamp rejected the credentials (401).")
+        r.raise_for_status()
+        token = (r.json() or {}).get("token")
+        if not token:
+            raise JLTampError("JLTamp login returned no token.")
+        self._token = token
+        return token
+
+    def list_users(self) -> list[dict]:
+        """All JLTamp users. Needs the admin account — used by the weekly job
+        to know who to build playlists for."""
+        data = self._get("/admin/users")
+        return data.get("users", []) if isinstance(data, dict) else []
+
+    def session_for(self, user_id: int) -> str | None:
+        """Mint a session token for another user (admin only).
+
+        The weekly playlists run as a background job with no user logged in, so
+        the engine asks JLTamp — as admin — for a token per user, then acts as
+        that user. Returns None if the endpoint is absent (server not yet
+        deployed) or the user is gone, so the caller can skip rather than crash.
+        """
+        try:
+            r = self.session.post(f"{self.url}/admin/users/{user_id}/session",
+                                  headers=self._headers(), timeout=20)
+        except requests.RequestException:
+            return None
+        if r.status_code != 200:
+            return None
+        return (r.json() or {}).get("token")
+
+    def me(self) -> dict | None:
+        """Who this token belongs to, or None if JLTamp rejects it.
+
+        This is what lets the AI trust a caller: rather than keeping its own
+        user list or a shared password, it asks JLTamp whether the token the
+        app already holds is valid, and for whom.
+        """
+        try:
+            r = self.session.get(f"{self.url}/auth/me", headers=self._headers(),
+                                 timeout=15)
+        except requests.RequestException:
+            return None
+        if r.status_code != 200:
+            return None
+        try:
+            data = r.json() or {}
+        except ValueError:
+            return None
+        return data.get("user", data) or None
+
+    def _get(self, path: str, **params) -> dict:
+        r = self.session.get(f"{self.url}{path}", headers=self._headers(),
+                             params=params, timeout=60)
+        if r.status_code == 401:
+            # Token expired or was revoked — get a fresh one and retry once.
+            self._token = ""
+            self.login()
+            r = self.session.get(f"{self.url}{path}", headers=self._headers(),
+                                 params=params, timeout=60)
+        r.raise_for_status()
+        return r.json() or {}
+
+    # ── library ──────────────────────────────────────────────────────────────
+    def healthz(self) -> dict:
+        r = self.session.get(f"{self.url}/healthz", timeout=10)
+        r.raise_for_status()
+        return r.json() or {}
+
+    def libraries(self) -> list[dict]:
+        data = self._get("/library/sections")
+        return data.get("MediaContainer", {}).get("Directory", []) or []
+
+    def library_keys(self) -> set[str] | None:
+        """De bibliotheken die DEZE gebruiker mag zien, als de sleutels die ook op
+        Track.library_id staan. None als het niet lukt — dan filteren we niet.
+
+        De AI leest de hele bibliotheek in met het service-account (admin, ziet
+        alles). Een gebruiker met alleen de Demo-bibliotheek kreeg daardoor
+        aanbevelingen uit Muzyk; de server gooit bij het opslaan wat hij niet
+        mag zien eruit, en er bleven 6 van de 50 nummers over.
+        """
+        try:
+            return {str(d.get("key")) for d in self.libraries() if d.get("key")}
+        except requests.RequestException:
+            return None
+
+    def fetch_tracks(self, page_size: int = 500) -> list[Track]:
+        """Every track the authenticated user can see, across all libraries.
+
+        Paged: a full library in one response would be a many-megabyte JSON that
+        both ends have to hold in memory at once.
+        """
+        out: list[Track] = []
+        for lib in self.libraries():
+            key = lib.get("key")
+            if not key:
+                continue
+            start = 0
+            while True:
+                data = self._get(
+                    f"/library/sections/{key}/all",
+                    type=10,
+                    **{"X-Plex-Container-Start": start,
+                       "X-Plex-Container-Size": page_size},
+                )
+                mc = data.get("MediaContainer", {})
+                items = mc.get("Metadata", []) or []
+                if not items:
+                    break
+                for m in items:
+                    out.append(self._to_track(m, str(key)))
+                start += len(items)
+                total = int(mc.get("totalSize") or 0)
+                if total and start >= total:
+                    break
+                if len(items) < page_size:
+                    break
+        return out
+
+    @staticmethod
+    def _to_track(m: dict, library_id: str) -> Track:
+        media = (m.get("Media") or [{}])[0]
+        part = (media.get("Part") or [{}])[0]
+        return Track(
+            rating_key=str(m.get("ratingKey") or ""),
+            title=m.get("title") or "",
+            artist=m.get("grandparentTitle") or "",
+            orig_artist=m.get("originalTitle") or "",
+            album=m.get("parentTitle") or "",
+            year=m.get("year"),
+            # `genre` needs the serializer patch; older servers just omit it.
+            genre=(m.get("genre") or "") or "",
+            duration_ms=int(m.get("duration") or 0),
+            play_count=int(m.get("viewCount") or 0),
+            last_played_at=int(m.get("lastViewedAt") or 0),
+            rating=float(m.get("userRating") or 0),
+            library_id=library_id,
+            path=part.get("file") or "",
+            added_at=int(m.get("addedAt") or 0),
+        )
+
+    def genres(self, library_key: str) -> list[str]:
+        data = self._get(f"/library/sections/{library_key}/genre")
+        mc = data.get("MediaContainer", {})
+        items = mc.get("Directory") or mc.get("Metadata") or []
+        return [g.get("title") for g in items if g.get("title")]
+
+    def backfill_genres(self, tracks: list[Track]) -> int:
+        """Fill in genres by asking per genre which tracks have it.
+
+        Older servers do not serialise `genre` on a track (it is on the model
+        but was missing from track_dict), yet they will happily filter by it.
+        So we walk the genre list and label what comes back. Without this the
+        embedding text is just "artist - title - album", which says nothing
+        about what the music sounds like — "Radiohead - Creep" gives the model
+        no way to know it is not hip-hop.
+
+        Skipped entirely when the server already sends genres.
+        """
+        by_key = {t.rating_key: t for t in tracks}
+        filled = 0
+        for lib in self.libraries():
+            key = lib.get("key")
+            if not key:
+                continue
+            for genre in self.genres(str(key)):
+                start = 0
+                while True:
+                    try:
+                        data = self._get(
+                            f"/library/sections/{key}/all", type=10, genre=genre,
+                            **{"X-Plex-Container-Start": start,
+                               "X-Plex-Container-Size": 500},
+                        )
+                    except requests.HTTPError:
+                        break
+                    items = data.get("MediaContainer", {}).get("Metadata", []) or []
+                    if not items:
+                        break
+                    for m in items:
+                        t = by_key.get(str(m.get("ratingKey")))
+                        if t is not None and not t.genre:
+                            t.genre = genre
+                            filled += 1
+                    start += len(items)
+                    if len(items) < 500:
+                        break
+        return filled
+
+    # ── listening signals ────────────────────────────────────────────────────
+    def liked_ids(self) -> set[str]:
+        try:
+            data = self._get("/likes/ids")
+        except requests.HTTPError:
+            return set()
+        mc = data.get("MediaContainer", data)
+        ids = mc.get("ratingKeys") or mc.get("Metadata") or []
+        out = set()
+        for i in ids:
+            out.add(str(i.get("ratingKey")) if isinstance(i, dict) else str(i))
+        return out
+
+    def most_played_ids(self, limit: int = 60) -> list[str]:
+        """This user's most-played track keys — the core of their taste."""
+        try:
+            data = self._get("/history/mostPlayed", type=10, limit=limit)
+        except requests.HTTPError:
+            return []
+        items = data.get("MediaContainer", {}).get("Metadata", []) or []
+        return [str(m.get("ratingKey")) for m in items if m.get("ratingKey")]
+
+    def skip_counts(self, days: int = 90, max_events: int = 5000) -> dict[str, int]:
+        """How often each track was abandoned early.
+
+        A skip is a real behavioural signal only when the listener bailed out —
+        `completed` false and under a third played. The old engine counted every
+        pause as a skip, which quietly punished tracks you liked enough to pause.
+        """
+        skips: dict[str, int] = {}
+        start = 0
+        page = 500
+        while start < max_events:
+            try:
+                data = self._get("/stats/history", start=start,
+                                 **self._history_params(days, page))
+            except requests.HTTPError:
+                break
+            items = data.get("MediaContainer", {}).get("History", []) or []
+            if not items:
+                break
+            for ev in items:
+                if ev.get("completed"):
+                    continue
+                if int(ev.get("percent") or 0) >= 33:
+                    continue
+                if int(ev.get("listenedMs") or 0) > 45_000:
+                    continue  # sat through most of a long intro; not a rejection
+                rk = str(ev.get("ratingKey") or "")
+                if rk:
+                    skips[rk] = skips.get(rk, 0) + 1
+            start += len(items)
+            if len(items) < page:
+                break
+        return skips
+
+    def _own_user_id(self) -> int | None:
+        """Van wie dit token is. Eén keer per client opgevraagd.
+
+        Nodig voor /stats/history: voor een ADMIN geeft die zonder user_id het
+        luisteren van de hele server terug. Het eigen account is admin, dus daar
+        telden de DNA-mix en de skips het luisteren van iedereen mee."""
+        if not hasattr(self, "_eigen_id"):
+            user = self.me() or {}
+            try:
+                self._eigen_id = int(user.get("id")) if user.get("id") is not None else None
+            except (TypeError, ValueError):
+                self._eigen_id = None
+        return self._eigen_id
+
+    def _history_params(self, days: int, page: int) -> dict:
+        """Parameters voor /stats/history, altijd voor de EIGEN gebruiker."""
+        params = {"days": days, "limit": page}
+        uid = self._own_user_id()
+        if uid is not None:
+            params["user_id"] = uid
+        return params
+
+    def history_events(self, days: int = 120, max_events: int = 4000) -> list[dict]:
+        """De eigen luistermomenten van deze gebruiker, nieuwste eerst, mét
+        tijdstip (`startedAt`) — voor wat je op welk moment draait."""
+        out: list[dict] = []
+        start = 0
+        page = 500
+        params = {"days": days, "limit": page}
+        uid = self._own_user_id()
+        if uid is not None:
+            params["user_id"] = uid
+        while start < max_events:
+            try:
+                data = self._get("/stats/history", start=start, **params)
+            except requests.HTTPError:
+                break
+            items = data.get("MediaContainer", {}).get("History", []) or []
+            if not items:
+                break
+            out.extend(items)
+            start += len(items)
+            if len(items) < page:
+                break
+        return out
+
+    def recent_play_counts(self, days: int = 56, max_events: int = 3000) -> dict[str, int]:
+        """Hoe vaak elk nummer de laatste `days` dagen echt beluisterd is.
+
+        `mostPlayed` telt over alle tijd, en verandert daardoor van week tot week
+        bijna niet: een DNA-mix daaruit was elke week dezelfde lijst. Dit is het
+        recente deel. Alleen wat je echt hoorde telt — afgemaakt, of minstens de
+        helft of een minuut — anders telt elke skip als favoriet.
+        """
+        counts: dict[str, int] = {}
+        start = 0
+        page = 500
+        while start < max_events:
+            try:
+                data = self._get("/stats/history", start=start,
+                                 **self._history_params(days, page))
+            except requests.HTTPError:
+                break
+            items = data.get("MediaContainer", {}).get("History", []) or []
+            if not items:
+                break
+            for ev in items:
+                heard = (ev.get("completed")
+                         or int(ev.get("percent") or 0) >= 50
+                         or int(ev.get("listenedMs") or 0) >= 60_000)
+                rk = str(ev.get("ratingKey") or "")
+                if rk and heard:
+                    counts[rk] = counts.get(rk, 0) + 1
+            start += len(items)
+            if len(items) < page:
+                break
+        return counts
+
+    # ── playlists ────────────────────────────────────────────────────────────
+    def lijst_nummers(self, rk: str) -> tuple[list[str], str]:
+        """De nummers van een playlist ("pl12") of een album ("al34"), en de naam.
+
+        Voor een radio "meer zoals deze lijst". Met het token van de beller, dus
+        een lijst die hij niet mag zien levert niets op."""
+        rk = (rk or "").strip()
+        pad = f"/playlists/{rk}/items" if rk.startswith("pl") else f"/library/metadata/{rk}/children"
+        try:
+            data = self._get(pad)
+        except requests.HTTPError:
+            return [], ""
+        mc = data.get("MediaContainer", {}) or {}
+        items = mc.get("Metadata", []) or []
+        keys = [str(m.get("ratingKey")) for m in items if m.get("ratingKey")]
+        naam = mc.get("title") or mc.get("title2") or ""
+        if not naam and rk.startswith("pl"):
+            try:
+                meta = self._get(f"/playlists/{rk}")
+                mmc = meta.get("MediaContainer", {}) or {}
+                naam = mmc.get("title") or ((mmc.get("Metadata") or [{}])[0].get("title") or "")
+            except requests.HTTPError:
+                pass
+        if not naam and items:
+            naam = items[0].get("parentTitle") or ""
+        return keys, naam
+
+    def playlist_track_keys(self, title: str) -> list[str]:
+        """De nummers in de lijst met deze titel ([] als die er niet is).
+
+        Voor de weeklijsten: zo weet Ontdekking wat er vorige week al in stond."""
+        rk = self.find_playlist(title)
+        if not rk:
+            return []
+        try:
+            data = self._get(f"/playlists/{rk}/items")
+        except requests.HTTPError:
+            return []
+        items = data.get("MediaContainer", {}).get("Metadata", []) or []
+        return [str(m.get("ratingKey")) for m in items if m.get("ratingKey")]
+
+    def find_playlist(self, title: str) -> str | None:
+        data = self._get("/playlists")
+        for p in data.get("MediaContainer", {}).get("Metadata", []) or []:
+            if (p.get("title") or "").strip().lower() == title.strip().lower():
+                return str(p.get("ratingKey"))
+        return None
+
+    def delete_playlist(self, rating_key: str) -> None:
+        self.session.delete(f"{self.url}/playlists/{rating_key}",
+                            headers=self._headers(), timeout=30)
+
+    def create_playlist(self, title: str, tracks: list[Track]) -> str:
+        """Create (replacing a same-named one) and return its ratingKey.
+
+        JLTamp takes track keys in Plex's `uri=` form. We chunk the additions:
+        a 50-track uri is fine, but a few hundred would blow past sane URL
+        lengths, and this is the one call that must not half-fail.
+        """
+        if not tracks:
+            raise JLTampError("refusing to create an empty playlist")
+
+        with self._lock:
+            # Build the new one FIRST, then drop the old. The other order — the
+            # one this used to do — has a window where the old playlist is gone
+            # and the new one does not exist yet, so a network hiccup or a
+            # server restart in between destroys a list the user had. JLTamp
+            # allows two playlists with the same title (there are already two
+            # "My Top Songs 2026" in this library), so the overlap is harmless.
+            existing = self.find_playlist(title)
+
+            head, tail = tracks[:50], tracks[50:]
+            uri = self._uri([t.rating_key for t in head])
+            r = self.session.post(
+                f"{self.url}/playlists", headers=self._headers(),
+                params={"title": title, "uri": uri, "type": "audio", "smart": 0},
+                timeout=60,
+            )
+            r.raise_for_status()
+            meta = (r.json() or {}).get("MediaContainer", {}).get("Metadata", [])
+            if not meta:
+                raise JLTampError("playlist create returned no ratingKey")
+            rk = str(meta[0].get("ratingKey"))
+
+            # Every chunk is checked. Unchecked, a rejected PUT left a playlist
+            # that is simply short, with nothing anywhere saying so.
+            for i in range(0, len(tail), 50):
+                chunk = tail[i:i + 50]
+                resp = self.session.put(
+                    f"{self.url}/playlists/{rk}/items", headers=self._headers(),
+                    params={"uri": self._uri([t.rating_key for t in chunk])},
+                    timeout=60,
+                )
+                resp.raise_for_status()
+
+            if existing and existing != rk:
+                try:
+                    self.delete_playlist(existing)
+                except requests.RequestException as e:
+                    # The new list is in place; a leftover duplicate is far
+                    # less bad than losing the old one, so say it and move on.
+                    print(f"⚠️  could not remove the previous '{title}': {e}")
+            return rk
+
+    @staticmethod
+    def _uri(keys: list[str]) -> str:
+        return ("server://jltamp-ai/com.plexapp.plugins.library/library/metadata/"
+                + ",".join(keys))
+
+
+class Library:
+    """An in-memory snapshot of the library, refreshed on a timer.
+
+    Scoring runs over every track on every request, so re-fetching per request
+    would put the whole library on the wire each time. One snapshot, shared,
+    swapped atomically.
+    """
+
+    def __init__(self, client: JLTampClient):
+        self.client = client
+        self.tracks: list[Track] = []
+        self.by_key: dict[str, Track] = {}
+        self.loaded_at = 0.0
+        self._lock = threading.Lock()
+
+    def refresh(self, features: dict | None = None) -> int:
+        tracks = self.client.fetch_tracks()
+
+        # Genre is the strongest "what does this sound like" signal we have.
+        # If the server did not send any, ask for it the long way round.
+        if tracks and not any(t.genre for t in tracks):
+            filled = self.client.backfill_genres(tracks)
+            print(f"🏷️  Genres backfilled for {filled} tracks "
+                  f"(server does not serialise `genre` yet).")
+
+        skips = self.client.skip_counts()
+        liked = self.client.liked_ids()
+        feats = features or {}
+        for t in tracks:
+            t.skips = skips.get(t.rating_key, 0)
+            t.liked = t.rating_key in liked
+            t.features = feats.get(t.rating_key, {})
+        with self._lock:
+            self.tracks = tracks
+            self.by_key = {t.rating_key: t for t in tracks}
+            self.loaded_at = time.time()
+        return len(tracks)
+
+    def snapshot(self) -> list[Track]:
+        with self._lock:
+            return self.tracks

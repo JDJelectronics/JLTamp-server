@@ -1,0 +1,322 @@
+"""JLTamp Music Server — entrypoint.
+
+Wires the Plex-compatible + multi-user routers together, initialises the SQLite
+DB, seeds the admin account, and (optionally) serves the web UI. Scanning is
+now MANUAL (Plex-style): libraries are added and scanned from the admin UI, so
+there is no auto-scan on startup.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import threading
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI, Depends
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.middleware.cors import CORSMiddleware
+
+from . import config, backup
+from .db import init_db
+from .deps import require_admin, seed_admin
+from .scanner import scan_all, scan_state, request_stop
+from .routers import presentator
+from .routers import radio as radio_router
+from .routers import auth, media, stream, artwork, playlists, libraries, admin_users, likes, uploads, history, stats, mix, session, importer, smart, lyrics, wishlist, artistinfo, popular, charts, diag, appversion
+from .routers import huis
+from .routers import feest
+from .routers import spel
+from .routers import admin_status as admin_status_router
+from .routers import karaoke
+from .routers import melodie as melodie_router
+from .routers import akkoorden
+from .routers import subsonic
+from .routers import noten
+from .routers import band
+from .routers import dj
+from .instellingen import servernaam as _servernaam
+from .routers import beheer as beheer_router
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("jltamp")
+
+VERSION = "0.4.3"
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Startup: prepare the DB, repair known data issues, guarantee the owner
+    # admin, and begin periodic consistent DB snapshots for the backup.
+    init_db()
+    _repair_years()
+    seed_admin()
+    # Het blok "Van JLTamp" maakte vroeger afspeellijsten aan — acht per
+    # gebruiker, plus een handvol openbare. Die horen daar niet en zijn eruit;
+    # dit haalt weg wat er nog van staat. Idempotent: de tweede keer vindt hij
+    # niets meer. Zie charts.opruimen.
+    try:
+        weg = charts.opruimen()
+        if weg.get("lijsten") or weg.get("voorkeuren"):
+            log.info("[opruimen] %s afspeellijsten en %s voorkeuren van het oude "
+                     "JLTamp-blok verwijderd", weg["lijsten"], weg["voorkeuren"])
+    except Exception as e:      # nooit het opstarten tegenhouden
+        log.warning("[opruimen] overgeslagen: %s", e)
+    backup.start()
+    # JLTamp Radio: de wachter kijkt naar de schakelaar en start de zender als
+    # die aan staat — ook na een herstart. Staat hij uit, dan doet dit niets.
+    from .radio import zender as radio_zender
+    radio_zender.start_wachter()
+    log.info("═" * 60)
+    log.info(" JLTamp Music Server (multi-user) v%s", VERSION)
+    log.info("  name        : %s", config.SERVER_NAME)
+    log.info("  server id   : %s", config.SERVER_ID)
+    log.info("  music dir   : %s (read-only)", config.MUSIC_DIR)
+    log.info("  data dir    : %s", config.DATA_DIR)
+    log.info("  admin       : %s", config.ADMIN_EMAIL)
+    log.info("  registration: %s", "open" if config.OPEN_REGISTRATION else "invite-only")
+    log.info("  importers   : %s", "on" if config.IMPORTERS else "off")
+    log.info("═" * 60)
+    yield
+    radio_zender.stop_wachter()
+    # Shutdown: one last consistent snapshot so a clean restart/redeploy always
+    # leaves the freshest possible backup copy.
+    backup.make_snapshot()
+
+
+# Interactive docs and the OpenAPI schema are OFF: on a public server they would
+# hand an anonymous visitor a full map of every endpoint and request body. Set
+# JLTAMP_DEV=1 locally to turn them back on.
+_DEV = os.environ.get("JLTAMP_DEV", "").strip().lower() in ("1", "true", "yes", "on")
+app = FastAPI(
+    title="JLTamp Music Server", version=VERSION,
+    lifespan=lifespan,
+    docs_url="/docs" if _DEV else None,
+    redoc_url="/redoc" if _DEV else None,
+    openapi_url="/openapi.json" if _DEV else None,
+)
+
+# Elke wijziging in Beheer in het logboek (zie logboek.py).
+from .logboek import LogboekMiddleware  # noqa: E402
+app.add_middleware(LogboekMiddleware)
+
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
+    allow_headers=["*"], allow_credentials=False,
+)
+
+for r in (auth.router, media.router, stream.router, artwork.router,
+          playlists.router, libraries.router, admin_users.router, likes.router,
+          uploads.router, history.router, stats.router, mix.router,
+          session.router, session.presence_router, importer.router,
+          smart.router, lyrics.router, wishlist.router,
+          huis.router,
+          feest.router,
+          spel.router,
+          admin_status_router.router,
+          beheer_router.router,
+          akkoorden.router,
+          noten.router,
+          band.router,
+          dj.router,
+          artistinfo.router, popular.router, charts.router, diag.router, appversion.router, karaoke.router,
+          melodie_router.router,
+          presentator.router,
+          radio_router.router,
+          subsonic.router):
+    app.include_router(r)
+
+
+def _repair_years() -> None:
+    """Older scans stored a compact date tag ("20180721") as the year, so those
+    albums/tracks sort and filter as the year twenty-million. The scanner now
+    parses the year properly; this repairs rows already in the database so the
+    fix applies without a full rescan. Idempotent — a no-op once clean."""
+    from .db import engine
+
+    with engine.begin() as conn:
+        fixed = 0
+        for table in ("albums", "tracks"):
+            # Leading 4 digits — "20180721" and "201807" both yield 2018, which
+            # dividing by a fixed power of ten would not.
+            res = conn.exec_driver_sql(
+                f"UPDATE {table} "
+                f"SET year = CAST(SUBSTR(CAST(year AS TEXT), 1, 4) AS INTEGER) "
+                f"WHERE year IS NOT NULL AND year > 9999"
+            )
+            fixed += res.rowcount or 0
+            # Whatever is still not a plausible year is not a year.
+            conn.exec_driver_sql(
+                f"UPDATE {table} SET year = NULL "
+                f"WHERE year IS NOT NULL AND (year < 1000 OR year > 2999)"
+            )
+        if fixed:
+            log.info("Repaired %d rows with a date stored as the year", fixed)
+
+
+# ── health check (for the container HEALTHCHECK / uptime monitors) ───────────
+@app.get("/healthz")
+def healthz():
+    """Liveness + DB reachability. Unauthenticated on purpose so a container
+    healthcheck / uptime monitor can hit it, but it leaks nothing beyond ok/db."""
+    from .db import engine
+    db_ok = True
+    try:
+        with engine.connect() as conn:
+            conn.exec_driver_sql("SELECT 1")
+    except Exception:
+        db_ok = False
+    status = "ok" if db_ok else "degraded"
+    return JSONResponse({"status": status, "db": db_ok, "version": VERSION},
+                        status_code=200 if db_ok else 503)
+
+
+# ── admin: manual scan of every library ──────────────────────────────────────
+@app.post("/admin/rescan")
+def admin_rescan(_: None = Depends(require_admin), full: bool = False):
+    threading.Thread(target=scan_all, kwargs={"full": full}, daemon=True).start()
+    return {"ok": True, "state": scan_state()}
+
+
+@app.post("/admin/rescan/stop")
+def admin_rescan_stop(_: None = Depends(require_admin)):
+    """Stop a running scan cleanly — keeps everything scanned so far."""
+    return {"ok": True, "state": request_stop()}
+
+
+@app.get("/admin/status")
+def admin_status(_: None = Depends(require_admin)):
+    return scan_state()
+
+
+# ── admin: loudness analysis (volume normalisation) ──────────────────────────
+@app.post("/admin/analyze-loudness")
+def admin_analyze_loudness(_: None = Depends(require_admin), limit: int | None = None):
+    """Measure loudness (ffmpeg) for tracks without a gain yet, and store it so
+    the app can level every track to the same volume. Resumable + stoppable."""
+    from . import loudness
+    return {"ok": True, "state": loudness.analyze_async(limit=limit)}
+
+
+@app.post("/admin/analyze-loudness/stop")
+def admin_analyze_loudness_stop(_: None = Depends(require_admin)):
+    from . import loudness
+    return {"ok": True, "state": loudness.request_stop()}
+
+
+@app.get("/admin/analyze-loudness/status")
+def admin_analyze_loudness_status(_: None = Depends(require_admin)):
+    from . import loudness
+    return loudness.state()
+
+
+# ── API root descriptor (kept at /api so the web UI can own "/") ─────────────
+def _open_registratie_nu() -> bool:
+    """Of iedereen zich mag aanmelden — de schakelaar uit het beheerscherm.
+
+    Dit is de enige plek waar het inlogscherm het kan zien: het vraagt dit
+    zonder token op, want het moet weten of het een aanmeldknop moet tonen nog
+    vóór er iemand is ingelogd. Zonder deze omweg bleef hier de waarde uit
+    docker-compose staan en had de schakelaar geen zichtbaar effect.
+    """
+    from .db import SessionLocal
+    from .routers.admin_users import open_registratie
+    db = SessionLocal()
+    try:
+        return open_registratie(db)
+    except Exception:
+        return bool(config.OPEN_REGISTRATION)
+    finally:
+        db.close()
+
+
+def _importeren_nu() -> bool:
+    """Staat de schakelaar "afspeellijsten importeren" aan?
+
+    Zelfde omweg als hierboven bij de registratie, en om dezelfde reden: de app
+    haalt dit zonder token op om te weten of hij de importkaart in de
+    instellingen moet tonen. Stond hier `config.IMPORTERS`, dan bleef de waarde
+    uit docker-compose staan — dan zette je de schakelaar in het beheerscherm
+    om en bleef de kaart weg.
+    """
+    from .db import SessionLocal
+    from .routers.admin_users import schakelaar
+    db = SessionLocal()
+    try:
+        return schakelaar(db, "importeren")
+    except Exception:
+        return bool(config.IMPORTERS)
+    finally:
+        db.close()
+
+
+def _descriptor():
+    return {
+        "server": "JLTamp Music Server",
+        "version": VERSION,
+        "name": _servernaam(),
+        "machineIdentifier": config.SERVER_ID,
+        # Public, unauthenticated: the login screen needs to know whether to offer
+        # a "create account" panel at all, and it has to ask before signing in.
+        "openRegistration": _open_registratie_nu(),
+        # Same idea for the playlist importers: the client hides the import UI
+        # when this is false, so a disabled feature shows no button at all.
+        "importers": _importeren_nu(),
+        "status": scan_state(),
+    }
+
+
+@app.get("/api")
+def api_root():
+    return _descriptor()
+
+
+# ── Web UI (Expo web export), served last so API routes win ──────────────────
+# Privacy policy — a real page at /privacy (declared before the SPA catch-all
+# below so it isn't swallowed by the app shell). Used for the Play Store listing.
+_PRIVACY = Path(__file__).parent / "static" / "privacy.html"
+_DELETE_ACCOUNT = Path(__file__).parent / "static" / "account-deletion.html"
+
+
+@app.get("/privacy")
+def _privacy():
+    return FileResponse(_PRIVACY, media_type="text/html")
+
+
+@app.get("/delete-account")
+def _delete_account():
+    return FileResponse(_DELETE_ACCOUNT, media_type="text/html")
+
+
+WEB_DIR = Path(os.environ.get("WEB_DIR", "/web"))
+_INDEX = WEB_DIR / "index.html"
+
+if WEB_DIR.is_dir() and _INDEX.exists():
+    # Serve hashed static assets directly.
+    for sub in ("_expo", "assets", "static"):
+        d = WEB_DIR / sub
+        if d.is_dir():
+            app.mount(f"/{sub}", StaticFiles(directory=d), name=sub)
+
+    @app.get("/")
+    def _root_index():
+        return FileResponse(_INDEX)
+
+    @app.get("/{full_path:path}")
+    def _spa(full_path: str):
+        """SPA fallback: serve the requested static file if it exists, else the
+        app shell (index.html) so client-side routes (e.g. /invite/xxx) work.
+        API routes are declared above, so they are matched before this."""
+        candidate = (WEB_DIR / full_path).resolve()
+        try:
+            if candidate.is_file() and WEB_DIR.resolve() in candidate.parents:
+                return FileResponse(candidate)
+        except Exception:
+            pass
+        return FileResponse(_INDEX)
+else:
+    @app.get("/")
+    def root():
+        return JSONResponse(_descriptor())

@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#0e0e11">
+<title>JLTamp Feest</title>
+<!--
+  De feestpagina. Wordt geserveerd door de JLTamp-server zelf (routers/feest.py)
+  op /feest/<token>, voor gasten zonder app of account.
+
+  Alles staat in dit ene bestand en er wordt niets van buiten geladen: geen CDN,
+  geen lettertype, geen analytics. Wat een gast binnenkrijgt is titel, artiest en
+  hoes; afspelen kan hier niet.
+
+  Alle tekst die van de server komt gaat via textContent de pagina in, nooit via
+  innerHTML — een bijnaam of titel is invoer van een vreemde.
+-->
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0e0e11;
+    --kaart: rgba(255,255,255,0.055);
+    --rand: rgba(255,255,255,0.09);
+    --tekst: #f2f2f4;
+    --zacht: #a1a1aa;
+    --flauw: #71717a;
+    --accent: #00d4aa;
+    --accent-zacht: rgba(0,212,170,0.14);
+    --rood: #ff6b6b;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: var(--bg); color: var(--tekst); }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 16px; line-height: 1.4; min-height: 100vh;
+    background:
+      radial-gradient(120% 60% at 50% -10%, rgba(0,212,170,0.22), transparent 60%),
+      radial-gradient(80% 50% at 100% 100%, rgba(120,80,255,0.12), transparent 60%),
+      var(--bg);
+    background-attachment: fixed;
+  }
+  .wrap { max-width: 560px; margin: 0 auto; padding: calc(18px + env(safe-area-inset-top)) 16px calc(40px + env(safe-area-inset-bottom)); }
+  header { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
+  header img { width: 36px; height: 36px; border-radius: 50%; }
+  header .kop { flex: 1; min-width: 0; }
+  header h1 { margin: 0; font-size: 21px; font-weight: 800; letter-spacing: -0.2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  header .wie { color: var(--zacht); font-size: 13px; }
+  .kaart { background: var(--kaart); border: 1px solid var(--rand); border-radius: 18px; padding: 14px; backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1.2px; color: var(--zacht); margin: 26px 4px 10px; font-weight: 700; }
+  .nu { display: flex; gap: 14px; align-items: center; }
+  .nu .hoes { width: 84px; height: 84px; border-radius: 14px; }
+  .nu .label { color: var(--accent); font-size: 12px; font-weight: 800; letter-spacing: 1px; text-transform: uppercase; }
+  .nu .titel { font-size: 19px; font-weight: 800; margin-top: 2px; }
+  .hoes { flex: none; width: 48px; height: 48px; border-radius: 10px; object-fit: cover; background: linear-gradient(135deg, #24242b, #17171c); display: block; }
+  .rij { display: flex; align-items: center; gap: 12px; padding: 9px 4px; }
+  .rij + .rij { border-top: 1px solid rgba(255,255,255,0.05); }
+  .tekst { flex: 1; min-width: 0; }
+  .titel { font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sub { color: var(--zacht); font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .door { color: var(--flauw); font-size: 12px; margin-top: 1px; }
+  .volgende { display: inline-block; color: #0e0e11; background: var(--accent); font-size: 11px; font-weight: 800; border-radius: 6px; padding: 1px 6px; margin-right: 6px; vertical-align: 1px; }
+  button { font: inherit; color: inherit; border: none; cursor: pointer; }
+  .duim { flex: none; display: flex; flex-direction: column; align-items: center; justify-content: center; min-width: 52px; height: 52px; border-radius: 14px; background: rgba(255,255,255,0.06); border: 1px solid var(--rand); font-weight: 800; font-size: 13px; }
+  .duim svg { width: 20px; height: 20px; }
+  .duim.aan { background: var(--accent-zacht); border-color: var(--accent); color: var(--accent); }
+  .plus { flex: none; width: 44px; height: 44px; border-radius: 50%; background: var(--accent); color: #0e0e11; display: flex; align-items: center; justify-content: center; }
+  .plus svg { width: 22px; height: 22px; }
+  .plus:disabled { opacity: 0.5; }
+  .zoek { position: sticky; top: 0; z-index: 5; padding: 10px 0; margin: 0 -2px; background: linear-gradient(var(--bg) 70%, transparent); }
+  .zoek input { width: 100%; height: 50px; border-radius: 25px; border: 1px solid var(--rand); background: rgba(255,255,255,0.07); color: var(--tekst); padding: 0 20px; font-size: 16px; outline: none; }
+  .zoek input:focus { border-color: var(--accent); }
+  .leeg { color: var(--flauw); text-align: center; padding: 14px 6px; font-size: 14px; }
+  .wensknop { width: 100%; margin-top: 10px; padding: 14px; border-radius: 14px; background: var(--accent-zacht); border: 1px dashed var(--accent); color: var(--accent); font-weight: 700; }
+  .melding { position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom)); transform: translateX(-50%) translateY(20px); opacity: 0; transition: all .25s ease; background: #1d1d23; border: 1px solid var(--rand); padding: 12px 18px; border-radius: 14px; max-width: calc(100% - 32px); text-align: center; z-index: 20; pointer-events: none; }
+  .melding.zicht { opacity: 1; transform: translateX(-50%) translateY(0); }
+  .laag { position: fixed; inset: 0; background: rgba(8,8,10,0.82); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); display: flex; align-items: center; justify-content: center; padding: 20px; z-index: 30; }
+  .laag[hidden] { display: none; }
+  .laag .kaart { width: 100%; max-width: 380px; padding: 22px; text-align: center; }
+  .laag h3 { margin: 4px 0 6px; font-size: 22px; }
+  .laag p { color: var(--zacht); margin: 0 0 16px; }
+  .laag input { width: 100%; height: 50px; border-radius: 14px; border: 1px solid var(--rand); background: rgba(255,255,255,0.07); color: var(--tekst); padding: 0 16px; font-size: 17px; outline: none; text-align: center; }
+  .laag input:focus { border-color: var(--accent); }
+  .grote { width: 100%; height: 50px; margin-top: 12px; border-radius: 25px; background: var(--accent); color: #0e0e11; font-weight: 800; font-size: 16px; }
+  .eind { text-align: center; padding: 80px 20px; }
+  .eind h2 { font-size: 22px; color: var(--tekst); text-transform: none; letter-spacing: 0; }
+  .ik { color: var(--zacht); font-size: 13px; text-align: right; }
+  .ik button { background: none; color: var(--accent); padding: 0; font-size: 13px; }
+  footer { color: var(--flauw); font-size: 12px; text-align: center; margin-top: 34px; }
+</style>
+</head>
+<body>
+<div class="wrap" id="app">
+  <header>
+    <img alt="" src="data:image/png;base64,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">
+    <div class="kop">
+      <h1 id="naam">JLTamp</h1>
+      <div class="wie" id="wie"></div>
+    </div>
+  </header>
+
+  <div id="inhoud" hidden>
+    <div class="kaart nu" id="nu"></div>
+
+    <div class="zoek"><input id="zoekveld" type="search" autocomplete="off" enterkeyhint="search"></div>
+    <div id="zoekvak" hidden>
+      <div class="kaart" id="resultaten"></div>
+    </div>
+
+    <h2 id="kopAanvragen"></h2>
+    <div class="kaart" id="aanvragen"></div>
+
+    <div id="daarnaVak" hidden>
+      <h2 id="kopDaarna"></h2>
+      <div class="kaart" id="daarna"></div>
+    </div>
+    <footer id="voet"></footer>
+  </div>
+
+  <div class="eind" id="eind" hidden>
+    <h2 id="eindKop"></h2>
+    <p class="sub" id="eindTekst"></p>
+  </div>
+</div>
+
+<div class="laag" id="naamLaag" hidden>
+  <form class="kaart" id="naamForm">
+    <h3 id="welkom"></h3>
+    <p id="welkomTekst"></p>
+    <input id="bijnaam" maxlength="24" autocomplete="nickname" required>
+    <button class="grote" type="submit" id="naamKnop"></button>
+  </form>
+</div>
+
+<div class="melding" id="melding"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  // ── Teksten ── Nederlands of Engels, naar de taal van de telefoon.
+  var T = {
+    nl: {
+      nu: 'Nu speelt', niets: 'Er speelt nog niets', aanvragen: 'Aanvragen',
+      geenAanvragen: 'Nog geen aanvragen. Zoek een nummer en vraag het aan!',
+      daarna: 'Daarna in de rij', zoek: 'Zoek een nummer of artiest…',
+      volgende: 'VOLGENDE', door: 'gevraagd door {n}', geenResultaat: 'Niet in de bibliotheek.',
+      wensKnop: '“{q}” op het verlanglijstje zetten', wensOver: 'nog {n} over',
+      welkom: 'Welkom op het feest!', welkomTekst: 'Kies een bijnaam. Meer hoeven we niet van je te weten.',
+      naamPlaceholder: 'Je bijnaam', doeMee: 'Doe mee', ikBen: 'Jij bent {n}', wissel: 'wissel',
+      aangevraagd: 'Aangevraagd!', gestemd: 'Stond er al — je stem is erbij geteld',
+      rustig: 'Even rustig aan — probeer het zo nog eens', fout: 'Dat lukte niet',
+      bestaatNiet: 'Dit feest bestaat niet', afgelopen: 'Dit feest is afgelopen',
+      eindTekst: 'Vraag de gastheer om een nieuwe code.',
+      voet: 'JLTamp · aanvragen gaan naar de gastheer, die beslist',
+      w_aangevraagd: 'Op het verlanglijstje: {x}', w_opnieuw: 'Op het verlanglijstje: {x}',
+      w_stond_al: 'Stond al op het verlanglijstje', w_hebben_we_al: 'Die is er al — zoek op “{t}”',
+      w_onbekend: 'Niet gevonden — probeer het anders te schrijven', w_genoeg: 'Je wensen voor dit feest zijn op',
+      w_vol: 'Het verlanglijstje zit vol', w_genoeg_voor_vandaag: 'Het verlanglijstje zit vol voor vandaag',
+      w_te_kort: 'Typ wat meer', w_geen_link: 'Typ de naam van het nummer, geen link', w_uit: 'Wensen kan nu niet',
+      w_mislukt_eerder: 'Die lukte eerder al niet', korter: 'Kies een bijnaam van minstens twee tekens',
+    },
+    en: {
+      nu: 'Now playing', niets: 'Nothing playing yet', aanvragen: 'Requests',
+      geenAanvragen: 'No requests yet. Search for a song and request it!',
+      daarna: 'Up next', zoek: 'Search a song or artist…',
+      volgende: 'NEXT', door: 'requested by {n}', geenResultaat: 'Not in the library.',
+      wensKnop: 'Put “{q}” on the wishlist', wensOver: '{n} left',
+      welkom: 'Welcome to the party!', welkomTekst: 'Pick a nickname. That is all we need to know.',
+      naamPlaceholder: 'Your nickname', doeMee: 'Join', ikBen: 'You are {n}', wissel: 'change',
+      aangevraagd: 'Requested!', gestemd: 'Already there — your vote was added',
+      rustig: 'Easy now — try again in a moment', fout: 'That did not work',
+      bestaatNiet: 'This party does not exist', afgelopen: 'This party is over',
+      eindTekst: 'Ask the host for a new code.',
+      voet: 'JLTamp · requests go to the host, who decides',
+      w_aangevraagd: 'On the wishlist: {x}', w_opnieuw: 'On the wishlist: {x}',
+      w_stond_al: 'Already on the wishlist', w_hebben_we_al: 'We have that one — search for “{t}”',
+      w_onbekend: 'Not found — try spelling it differently', w_genoeg: 'Your wishes for this party are used up',
+      w_vol: 'The wishlist is full', w_genoeg_voor_vandaag: 'The wishlist is full for today',
+      w_te_kort: 'Type a bit more', w_geen_link: 'Type the song name, not a link', w_uit: 'Wishes are not available',
+      w_mislukt_eerder: 'That one failed before', korter: 'Pick a nickname of at least two characters',
+    }
+  };
+  var taal = String((navigator.languages && navigator.languages[0]) || navigator.language || 'nl').toLowerCase();
+  var L = (taal.indexOf('nl') === 0 || taal.indexOf('fy') === 0) ? T.nl : T.en;
+  document.documentElement.lang = L === T.nl ? 'nl' : 'en';
+  function t(k, v) {
+    var s = L[k] || T.nl[k] || k;
+    if (v) Object.keys(v).forEach(function (n) { s = s.split('{' + n + '}').join(v[n]); });
+    return s;
+  }
+
+  // ── Waar zijn we ──
+  var token = decodeURIComponent(location.pathname.replace(/\/+$/, '').split('/').pop() || '');
+  var basis = '/feest/' + encodeURIComponent(token);
+  var opslagSleutel = 'jltamp-feest-' + token;
+  var gast = null;
+  try { gast = localStorage.getItem(opslagSleutel); } catch (e) { /* privé-venster */ }
+
+  var $ = function (id) { return document.getElementById(id); };
+  var stand = null, klaar = false;
+
+  // ── Kleine DOM-hulpjes (alles via textContent) ──
+  function el(tag, cls, tekst) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (tekst != null) e.textContent = tekst;
+    return e;
+  }
+  function hoes(url, cls) {
+    var h = el('div', 'hoes' + (cls ? ' ' + cls : ''));
+    if (url) {
+      var img = el('img', 'hoes' + (cls ? ' ' + cls : ''));
+      img.alt = ''; img.loading = 'lazy'; img.src = url;
+      img.onerror = function () { img.replaceWith(h); };
+      return img;
+    }
+    return h;
+  }
+  var SVG_DUIM = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M2 21h3V9H2v12zm20-11a2 2 0 0 0-2-2h-6.3l1-4.6v-.3c0-.4-.2-.8-.4-1.1L13.2 1 6.6 7.6C6.2 7.9 6 8.4 6 9v10a2 2 0 0 0 2 2h9c.8 0 1.5-.5 1.8-1.2l3-7.1c.1-.2.2-.5.2-.7v-2z"/></svg>';
+  var SVG_PLUS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>';
+
+  var meldTimer = null;
+  function meld(tekst) {
+    var m = $('melding');
+    m.textContent = tekst;
+    m.classList.add('zicht');
+    clearTimeout(meldTimer);
+    meldTimer = setTimeout(function () { m.classList.remove('zicht'); }, 2600);
+  }
+
+  // ── Praten met de server ──
+  function vraag(pad, opties) {
+    opties = opties || {};
+    var headers = { 'Accept': 'application/json' };
+    if (gast) headers['X-Feest-Gast'] = gast;
+    if (opties.body) headers['Content-Type'] = 'application/json';
+    return fetch(basis + pad, {
+      method: opties.method || 'GET', headers: headers,
+      body: opties.body ? JSON.stringify(opties.body) : undefined,
+      cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer',
+    }).then(function (r) {
+      if (r.status === 404 || r.status === 410) {
+        // Een onbekende aanvraag is geen dood feest; alleen de stand beslist dat.
+        if (pad === '/stand' || pad === '/gast') { einde(r.status); throw new Error('einde'); }
+      }
+      if (r.status === 401) { gast = null; vraagNaam(); throw new Error('naam'); }
+      if (r.status === 429) { meld(t('rustig')); throw new Error('429'); }
+      if (!r.ok) {
+        return r.json().catch(function () { return {}; }).then(function (d) {
+          meld((d && d.detail) || t('fout')); throw new Error('fout');
+        });
+      }
+      return r.json();
+    });
+  }
+
+  function einde(status) {
+    klaar = true;
+    $('inhoud').hidden = true;
+    $('naamLaag').hidden = true;
+    $('eind').hidden = false;
+    $('eindKop').textContent = status === 404 ? t('bestaatNiet') : t('afgelopen');
+    $('eindTekst').textContent = t('eindTekst');
+    try { localStorage.removeItem(opslagSleutel); } catch (e) {}
+  }
+
+  // ── Tekenen ──
+  function teken(d) {
+    stand = d;
+    $('inhoud').hidden = false;
+    $('naam').textContent = d.naam || 'JLTamp';
+    document.title = (d.naam || 'Feest') + ' · JLTamp';
+
+    var wie = $('wie');
+    wie.textContent = '';
+    if (d.ik) {
+      wie.appendChild(document.createTextNode(t('ikBen', { n: d.ik.bijnaam }) + ' · '));
+      var w = el('button', null, t('wissel'));
+      w.style.cssText = 'background:none;color:var(--accent);padding:0;font-size:13px';
+      w.onclick = function () { vraagNaam(d.ik.bijnaam); };
+      wie.appendChild(w);
+    }
+
+    // Nu speelt
+    var nu = $('nu');
+    nu.textContent = '';
+    nu.appendChild(hoes(d.nu && d.nu.hoes));
+    var nt = el('div', 'tekst');
+    nt.appendChild(el('div', 'label', t('nu')));
+    nt.appendChild(el('div', 'titel', d.nu ? d.nu.titel : t('niets')));
+    if (d.nu && d.nu.artiest) nt.appendChild(el('div', 'sub', d.nu.artiest));
+    nu.appendChild(nt);
+
+    // Aanvragen, gesorteerd door de server: ingepland bovenaan, dan op stemmen.
+    $('kopAanvragen').textContent = t('aanvragen') + (d.aanvragen.length ? ' · ' + d.aanvragen.length : '');
+    var lijst = $('aanvragen');
+    lijst.textContent = '';
+    if (!d.aanvragen.length) lijst.appendChild(el('div', 'leeg', t('geenAanvragen')));
+    d.aanvragen.forEach(function (a) {
+      var r = el('div', 'rij');
+      r.appendChild(hoes(a.hoes));
+      var tx = el('div', 'tekst');
+      var ti = el('div', 'titel');
+      if (a.volgende) ti.appendChild(el('span', 'volgende', t('volgende')));
+      ti.appendChild(document.createTextNode(a.titel));
+      tx.appendChild(ti);
+      tx.appendChild(el('div', 'sub', a.artiest));
+      tx.appendChild(el('div', 'door', t('door', { n: a.bijnaam })));
+      r.appendChild(tx);
+      var knop = el('button', 'duim' + (a.gestemd ? ' aan' : ''));
+      knop.innerHTML = SVG_DUIM;   // vaste tekening, geen data van buiten
+      knop.appendChild(el('span', null, String(a.stemmen)));
+      knop.setAttribute('aria-pressed', a.gestemd ? 'true' : 'false');
+      knop.onclick = function () {
+        if (!gast) { vraagNaam(); return; }
+        knop.disabled = true;
+        vraag('/stem/' + a.id, { method: 'POST' }).then(teken).catch(function () {}).then(function () { knop.disabled = false; });
+      };
+      r.appendChild(knop);
+      lijst.appendChild(r);
+    });
+
+    // Wat de gastheer zelf al in de rij heeft staan.
+    var daarna = $('daarna');
+    daarna.textContent = '';
+    $('daarnaVak').hidden = !(d.wachtrij && d.wachtrij.length);
+    $('kopDaarna').textContent = t('daarna');
+    (d.wachtrij || []).forEach(function (x) {
+      var r = el('div', 'rij');
+      r.appendChild(hoes(x.hoes));
+      var tx = el('div', 'tekst');
+      tx.appendChild(el('div', 'titel', x.titel));
+      tx.appendChild(el('div', 'sub', x.artiest));
+      r.appendChild(tx);
+      daarna.appendChild(r);
+    });
+  }
+
+  function ververs() {
+    if (klaar) return Promise.resolve();
+    return vraag('/stand').then(teken).catch(function () {});
+  }
+
+  // ── Bijnaam ──
+  function vraagNaam(huidig) {
+    if (klaar) return;
+    $('naamLaag').hidden = false;
+    var i = $('bijnaam');
+    i.value = huidig || '';
+    setTimeout(function () { i.focus(); }, 50);
+  }
+  $('naamForm').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var naam = $('bijnaam').value.trim();
+    if (naam.length < 2) { meld(t('korter')); return; }
+    var oud = gast; gast = null;
+    vraag('/gast', { method: 'POST', body: { bijnaam: naam } }).then(function (d) {
+      gast = d.gast;
+      try { localStorage.setItem(opslagSleutel, gast); } catch (e2) {}
+      $('naamLaag').hidden = true;
+      teken(d);
+    }).catch(function () { if (!gast) gast = oud; });
+  });
+
+  // ── Zoeken ──
+  var zoekTimer = null, zoekNr = 0;
+  $('zoekveld').addEventListener('input', function () {
+    clearTimeout(zoekTimer);
+    var q = this.value.trim();
+    if (q.length < 2) { $('zoekvak').hidden = true; return; }
+    zoekTimer = setTimeout(function () { zoek(q); }, 350);
+  });
+  function zoek(q) {
+    if (!gast) { vraagNaam(); return; }
+    var nr = ++zoekNr;
+    vraag('/zoek?q=' + encodeURIComponent(q)).then(function (d) {
+      if (nr !== zoekNr) return;
+      var vak = $('resultaten');
+      vak.textContent = '';
+      $('zoekvak').hidden = false;
+      if (!d.items.length) vak.appendChild(el('div', 'leeg', t('geenResultaat')));
+      d.items.forEach(function (it) {
+        var r = el('div', 'rij');
+        r.appendChild(hoes(it.hoes));
+        var tx = el('div', 'tekst');
+        tx.appendChild(el('div', 'titel', it.titel));
+        tx.appendChild(el('div', 'sub', it.artiest + (it.album ? ' · ' + it.album : '')));
+        r.appendChild(tx);
+        var knop = el('button', 'plus');
+        knop.innerHTML = SVG_PLUS;
+        knop.setAttribute('aria-label', t('aanvragen'));
+        knop.onclick = function () {
+          knop.disabled = true;
+          vraag('/aanvraag', { method: 'POST', body: { id: it.id } }).then(function (a) {
+            meld(a.status === 'gestemd' ? t('gestemd') : t('aangevraagd'));
+            teken(a);
+            $('zoekveld').value = '';
+            $('zoekvak').hidden = true;
+          }).catch(function () { knop.disabled = false; });
+        };
+        r.appendChild(knop);
+        vak.appendChild(r);
+      });
+      // Niets gevonden, of niet wat je zocht? Dan mag je het wensen — als de
+      // gastheer dat toestaat en je er nog over hebt.
+      if (stand && stand.wensen && stand.ik && stand.ik.wensenOver > 0 && q.length >= 4) {
+        var wk = el('button', 'wensknop', t('wensKnop', { q: q }) + ' (' + t('wensOver', { n: stand.ik.wensenOver }) + ')');
+        wk.onclick = function () {
+          wk.disabled = true;
+          vraag('/wens', { method: 'POST', body: { tekst: q } }).then(function (w) {
+            var x = [w.artiest, w.titel].filter(Boolean).join(' — ') || q;
+            meld(t('w_' + w.status, { x: x, t: w.titel || q }));
+            if (stand && stand.ik) stand.ik.wensenOver = w.wensenOver;
+            if (w.status === 'aangevraagd' || w.status === 'opnieuw') wk.remove();
+            else wk.disabled = false;
+          }).catch(function () { wk.disabled = false; });
+        };
+        vak.appendChild(wk);
+      }
+    }).catch(function () {});
+  }
+
+  // ── Opstarten ──
+  $('zoekveld').placeholder = t('zoek');
+  $('welkom').textContent = t('welkom');
+  $('welkomTekst').textContent = t('welkomTekst');
+  $('bijnaam').placeholder = t('naamPlaceholder');
+  $('naamKnop').textContent = t('doeMee');
+  $('voet').textContent = t('voet');
+
+  ververs().then(function () {
+    if (!klaar && (!stand || !stand.ik)) { gast = null; vraagNaam(); }
+  });
+  // Elke vijf tellen de stand; niet als de pagina op de achtergrond staat.
+  setInterval(function () { if (!document.hidden) ververs(); }, 5000);
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) ververs(); });
+})();
+</script>
+</body>
+</html>

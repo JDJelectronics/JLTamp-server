@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<CommunityApplications>
+  <Profile>
+**JLTamp** is a self-hosted music server by JLT Electronics, with its own apps for Android, iOS, CarPlay and Android Auto, a built-in web player and a Subsonic/OpenSubsonic API.
+
+This repository ships one template: **JLTamp-Server** (ghcr.io/jltelectronics/jltamp-server, amd64 and arm64).
+
+Questions and bug reports: [GitHub issues](https://github.com/JLTelectronics/JLTamp-server/issues).
+  </Profile>
+  <Icon>https://raw.githubusercontent.com/JLTelectronics/JLTamp-server/main/docs/icon.png</Icon>
+  <WebPage>https://github.com/JLTelectronics/JLTamp-server</WebPage>
+  <Photo>https://raw.githubusercontent.com/JLTelectronics/JLTamp-server/main/docs/screenshots/home.jpg</Photo>
+  <Photo>https://raw.githubusercontent.com/JLTelectronics/JLTamp-server/main/docs/screenshots/player.jpg</Photo>
+  <Photo>https://raw.githubusercontent.com/JLTelectronics/JLTamp-server/main/docs/screenshots/tablet-home.jpg</Photo>
+</CommunityApplications>

@@ -1,0 +1,79 @@
+# JLTamp Server as a CasaOS app. Install it via App Store → Custom Install →
+# Import (paste this file), or submit it to the CasaOS app store.
+name: jltamp-server
+services:
+  jltamp-server:
+    image: ghcr.io/jltelectronics/jltamp-server:latest
+    container_name: jltamp-server
+    restart: unless-stopped
+    ports:
+      - target: 32400
+        published: "32400"
+        protocol: tcp
+    volumes:
+      - type: bind
+        source: /DATA/Media/Music
+        target: /music
+        read_only: true
+      - type: bind
+        source: /DATA/AppData/jltamp-server
+        target: /data
+    environment:
+      SERVER_NAME: JLTamp
+    x-casaos:
+      ports:
+        - container: "32400"
+          description:
+            en_us: Web player, apps and Subsonic API
+            nl_nl: Webspeler, apps en Subsonic-API
+      volumes:
+        - container: /music
+          description:
+            en_us: Your music, mounted read-only
+            nl_nl: Je muziek, alleen-lezen
+        - container: /data
+          description:
+            en_us: Database, artwork cache and backups
+            nl_nl: Database, hoezen en back-ups
+      envs:
+        - container: SERVER_NAME
+          description:
+            en_us: Name shown in the apps
+            nl_nl: Naam in de apps
+
+x-casaos:
+  architectures:
+    - amd64
+    - arm64
+  main: jltamp-server
+  author: JLTamp
+  developer: JLTamp
+  category: Media
+  icon: https://raw.githubusercontent.com/JLTelectronics/JLTamp-server/main/docs/icon.png
+  thumbnail: https://raw.githubusercontent.com/JLTelectronics/JLTamp-server/main/docs/feature-graphic.png
+  screenshot_link:
+    - https://raw.githubusercontent.com/JLTelectronics/JLTamp-server/main/docs/screenshots/home.jpg
+    - https://raw.githubusercontent.com/JLTelectronics/JLTamp-server/main/docs/screenshots/player.jpg
+    - https://raw.githubusercontent.com/JLTelectronics/JLTamp-server/main/docs/screenshots/tablet-home.jpg
+  title:
+    en_us: JLTamp
+  tagline:
+    en_us: Your music. Your server.
+    nl_nl: Je eigen muziek, op je eigen server.
+  description:
+    en_us: >-
+      Self-hosted music server with its own apps for Android, iOS, CarPlay and
+      Android Auto, and a web player built in. Multi-user, Listen Together, a
+      24/7 radio, karaoke, party mode and a Subsonic/OpenSubsonic API for
+      clients such as Symfonium and Feishin. Open the app after installing to
+      create the admin account, then add your music under Settings, Libraries.
+    nl_nl: >-
+      Eigen muziekserver met apps voor Android, iOS, CarPlay en Android Auto, en
+      een ingebouwde webspeler. Meerdere gebruikers, samen luisteren, een
+      24/7-radio, karaoke, feestmodus en een Subsonic-API voor apps als
+      Symfonium en Feishin. Open de app na het installeren om het
+      beheerdersaccount te maken en voeg je muziek toe onder Instellingen,
+      Bibliotheken.
+  index: /
+  port_map: "32400"
+  scheme: http

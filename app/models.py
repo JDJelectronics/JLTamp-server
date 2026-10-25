@@ -1,0 +1,505 @@
+"""Database model. A music library is small enough that a handful of flat
+tables + denormalised names (so we rarely need joins on hot list endpoints)
+keeps everything fast and simple.
+
+ratingKey scheme: Plex uses one opaque global id space. We mirror that with a
+type prefix so a single `/library/metadata/{ratingKey}` route resolves to the
+right entity and playlist `uri`s can reference track keys:
+    track   -> "t{id}"      album -> "al{id}"
+    artist  -> "ar{id}"     playlist -> "pl{id}"
+Helpers for this live in ids.py.
+
+Multi-user (2026-07): users log in with their own email (invite-only). Music is
+organised into admin-defined libraries (Plex-style); each user is granted access
+to specific libraries. Playlists and liked songs are per-user.
+"""
+from __future__ import annotations
+
+from sqlalchemy import Integer, String, Float, Boolean, ForeignKey, Index, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column
+
+from .db import Base
+
+
+class Meta(Base):
+    __tablename__ = "meta"
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    value: Mapped[str] = mapped_column(String, default="")
+
+
+# ── Users / auth ─────────────────────────────────────────────────────────────
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(String, unique=True, index=True)
+    # null until the invited user sets their password (invite-only signup).
+    password_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    display_name: Mapped[str] = mapped_column(String, default="")
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # set for a pending invite; consumed when the user sets a password.
+    invite_token: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    # "Forgot password": a one-shot token, mailed to the user, that EXPIRES.
+    # Kept apart from invite_token so a reset can never revive a withdrawn invite
+    # or vice versa.
+    reset_token: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    reset_expires_at: Mapped[int] = mapped_column(Integer, default=0)
+    thumb_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, default=0)
+    # Email me a digest when a manual scan adds new music. Per-user, default on;
+    # the user can switch it off from Settings on the web.
+    notify_new_music: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Preferred language ('nl', 'en', 'fy', 'de', 'es-ES', 'pt-BR', 'pt-PT').
+    # Chosen/auto-detected at signup; used to localize outgoing mail.
+    lang: Mapped[str | None] = mapped_column(String, nullable=True)
+    # How much of your listening the OTHER people on this server may see:
+    #
+    #   "none"     — nothing at all; you do not appear as a listener.
+    #   "presence" — that you have music on, and nothing about what. THE DEFAULT.
+    #   "track"    — what you are playing, too.
+    #
+    # Default is the middle one on purpose: sharing the fact is friendly and
+    # costs nothing, sharing the song is a decision. Nobody is opted into
+    # broadcasting their taste by a migration.
+    share_activity: Mapped[str] = mapped_column(String, default="presence")
+    # Een account voor een winkelbeoordeling.
+    #
+    # De demo waarmee Apple en Google de app nakijken, hoort een kale app te
+    # zien: muziek, zoeken, afspelen. Het blok "Van JLTamp" is een aanbeveling
+    # die op luistergeschiedenis leunt — een vers reviewaccount heeft die niet,
+    # en wat er dan staat is de terugval van het huis. Dat is precies het soort
+    # ruis waar zo'n beoordeling over struikelt.
+    #
+    # Zet dit aan en het blok blijft bij dat account weg. Verder verandert er
+    # niets: het is geen tweede app, alleen een stiller beginscherm.
+    is_review: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class Session(Base):
+    """A bearer token -> user mapping. Tokens are sent as `X-Plex-Token`
+    (header or query) exactly like before, but now resolve to a specific user."""
+    __tablename__ = "sessions"
+    token: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    created_at: Mapped[int] = mapped_column(Integer, default=0)
+    last_seen_at: Mapped[int] = mapped_column(Integer, default=0)
+    label: Mapped[str] = mapped_column(String, default="")  # e.g. "web", "android"
+
+
+# ── Libraries (Plex-style, admin-managed) ────────────────────────────────────
+class Library(Base):
+    __tablename__ = "libraries"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String, index=True)
+    kind: Mapped[str] = mapped_column(String, default="music")  # future: podcasts etc.
+    created_at: Mapped[int] = mapped_column(Integer, default=0)
+    # last scan bookkeeping (shown in admin UI)
+    last_scan_at: Mapped[int] = mapped_column(Integer, default=0)
+    last_scan_ms: Mapped[int] = mapped_column(Integer, default=0)
+    track_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class LibraryFolder(Base):
+    """A library can contain several folders (all under the read-only mounts)."""
+    __tablename__ = "library_folders"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    library_id: Mapped[int] = mapped_column(ForeignKey("libraries.id"), index=True)
+    path: Mapped[str] = mapped_column(String)  # absolute path inside the container
+
+
+class UserLibraryAccess(Base):
+    """Which libraries a user may see (Plex-style sharing). Admin implicitly
+    sees everything, so admins need no rows here."""
+    __tablename__ = "user_library_access"
+    __table_args__ = (UniqueConstraint("user_id", "library_id", name="uq_user_library"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    library_id: Mapped[int] = mapped_column(ForeignKey("libraries.id"), index=True)
+
+
+# ── Music entities ───────────────────────────────────────────────────────────
+class Artist(Base):
+    __tablename__ = "artists"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    library_id: Mapped[int] = mapped_column(ForeignKey("libraries.id"), index=True, default=0)
+    name: Mapped[str] = mapped_column(String, index=True)
+    sort_name: Mapped[str] = mapped_column(String, index=True, default="")
+    summary: Mapped[str] = mapped_column(String, default="")
+    art_path: Mapped[str | None] = mapped_column(String, nullable=True)  # abs path to an image file
+    # online-enriched artist photo (Deezer etc.), cached under the data dir.
+    online_art_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    enriched: Mapped[bool] = mapped_column(Boolean, default=False)  # metadata lookup done
+    added_at: Mapped[int] = mapped_column(Integer, default=0)  # epoch seconds
+
+
+class Album(Base):
+    __tablename__ = "albums"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    library_id: Mapped[int] = mapped_column(ForeignKey("libraries.id"), index=True, default=0)
+    title: Mapped[str] = mapped_column(String, index=True)
+    sort_title: Mapped[str] = mapped_column(String, index=True, default="")
+    artist_id: Mapped[int] = mapped_column(ForeignKey("artists.id"), index=True)
+    artist_name: Mapped[str] = mapped_column(String, default="")
+    year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    genre: Mapped[str] = mapped_column(String, default="", index=True)
+    art_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    online_art_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    enriched: Mapped[bool] = mapped_column(Boolean, default=False)
+    track_count: Mapped[int] = mapped_column(Integer, default=0)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    added_at: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class Track(Base):
+    __tablename__ = "tracks"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    library_id: Mapped[int] = mapped_column(ForeignKey("libraries.id"), index=True, default=0)
+    title: Mapped[str] = mapped_column(String, index=True)
+    sort_title: Mapped[str] = mapped_column(String, index=True, default="")
+    album_id: Mapped[int] = mapped_column(ForeignKey("albums.id"), index=True)
+    album_title: Mapped[str] = mapped_column(String, default="")
+    artist_id: Mapped[int] = mapped_column(ForeignKey("artists.id"), index=True)
+    artist_name: Mapped[str] = mapped_column(String, default="")   # album/grouping artist (grandparentTitle)
+    album_artist: Mapped[str] = mapped_column(String, default="")
+    orig_artist: Mapped[str] = mapped_column(String, default="")   # the track's own artist (Plex originalTitle)
+    track_no: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    disc_no: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    genre: Mapped[str] = mapped_column(String, default="", index=True)
+    year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # File / media info
+    path: Mapped[str] = mapped_column(String, unique=True)   # absolute path on disk
+    ext: Mapped[str] = mapped_column(String, default="")     # ".flac" etc (lowercase)
+    container: Mapped[str] = mapped_column(String, default="")
+    codec: Mapped[str] = mapped_column(String, default="")
+    bitrate: Mapped[int] = mapped_column(Integer, default=0)   # kbps
+    channels: Mapped[int] = mapped_column(Integer, default=2)
+    samplerate: Mapped[int] = mapped_column(Integer, default=44100)
+    bits: Mapped[int] = mapped_column(Integer, default=16)
+    size: Mapped[int] = mapped_column(Integer, default=0)      # bytes
+    mtime: Mapped[float] = mapped_column(Float, default=0.0)   # file mtime for incremental rescan
+
+    art_path: Mapped[str | None] = mapped_column(String, nullable=True)  # usually the album cover
+    added_at: Mapped[int] = mapped_column(Integer, default=0)
+    last_played_at: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    play_count: Mapped[int] = mapped_column(Integer, default=0)
+    # Loudness-normalisation gain in dB (ReplayGain track gain / EBU R128),
+    # relative to the reference level. NULL = not analysed yet. The app levels
+    # playback volume with this so quiet and loud tracks sound equally loud.
+    gain_db: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+# ── Per-user playlists & likes ───────────────────────────────────────────────
+class Playlist(Base):
+    __tablename__ = "playlists"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, default=0)
+    title: Mapped[str] = mapped_column(String)
+    created_at: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[int] = mapped_column(Integer, default=0)
+    # Set the first time the owner shares this playlist — a short opaque code used
+    # to join it (link / QR / on-network invite). Null = private (never shared).
+    share_code: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    # Van het huis: iedereen op deze server ziet hem, niemand behalve de eigenaar
+    # kan hem wijzigen. Dit is iets anders dan share_code (dat is "ik deel mijn
+    # lijst met wie de code heeft, en die mag meedoen"). De JLTamp Top 40 is de
+    # eerste die dit gebruikt: één lijst, door de server zelf bijgehouden, voor
+    # iedereen hetzelfde.
+    is_public: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    # Waar de inhoud vandaan komt als de server hem zelf vult ("top40"). Leeg bij
+    # een gewone lijst. Zo kan de wekelijkse ronde zijn eigen lijst terugvinden
+    # zonder op de titel te zoeken — die mag de eigenaar veranderen.
+    feed: Mapped[str] = mapped_column(String, default="", index=True)
+
+
+class PlaylistMember(Base):
+    """A user who was invited into a shared (collaborative) playlist. The owner is
+    NOT stored here — ownership stays on Playlist.user_id; membership is everyone
+    else who joined via the share code. Any member may add/remove tracks."""
+    __tablename__ = "playlist_members"
+    __table_args__ = (UniqueConstraint("playlist_id", "user_id", name="uq_playlist_member"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    playlist_id: Mapped[int] = mapped_column(ForeignKey("playlists.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    joined_at: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class PlaylistItem(Base):
+    __tablename__ = "playlist_items"
+    # id == Plex's `playlistItemID` (used by DELETE /playlists/{rk}/items/{id})
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    playlist_id: Mapped[int] = mapped_column(ForeignKey("playlists.id"), index=True)
+    track_id: Mapped[int] = mapped_column(ForeignKey("tracks.id"), index=True)
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    # Who added this track (for shared-playlist attribution). Null on old rows /
+    # single-user playlists — the client falls back to the owner then.
+    added_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    # Wanneer dit nummer in DEZE lijst kwam.
+    #
+    # Niet hetzelfde als wanneer het in de bibliotheek kwam: een plaat van 2019
+    # die je vanmiddag aan een lijst toevoegt hoort bovenaan "onlangs
+    # toegevoegd" te staan, niet onderaan. Nul op regels van vóór deze kolom;
+    # dan valt het sorteren terug op de eigen volgorde van de lijst.
+    added_at: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class LikedTrack(Base):
+    """Per-user 'liked songs'."""
+    __tablename__ = "liked_tracks"
+    __table_args__ = (UniqueConstraint("user_id", "track_id", name="uq_user_liked"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    track_id: Mapped[int] = mapped_column(ForeignKey("tracks.id"), index=True)
+    created_at: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class UserTrackState(Base):
+    """Per-user playback state: play count, last-played time, and resume offset.
+    History is per user (not global on Track) so multi-user plays never collide.
+    Powers 'Recently played', 'Most played', play counts and resume."""
+    __tablename__ = "user_track_state"
+    __table_args__ = (UniqueConstraint("user_id", "track_id", name="uq_user_track_state"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    track_id: Mapped[int] = mapped_column(ForeignKey("tracks.id"), index=True)
+    play_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_played_at: Mapped[int] = mapped_column(Integer, default=0)
+    view_offset_ms: Mapped[int] = mapped_column(Integer, default=0)
+    # Plex-style star rating, 0-10 (0 = unrated). Per user, like everything else
+    # here: one listener's 5 stars is not another's.
+    rating: Mapped[float] = mapped_column(Float, default=0.0)
+
+
+class PlayEvent(Base):
+    """One listening session: this user played this track, then, for this long.
+
+    UserTrackState is the *current* state (counter, resume point) — it cannot
+    tell you what you listened to last Tuesday. This is the append-only log that
+    can: it powers the history list, the per-day charts and the top-artist stats.
+    Denormalised artist/album/title so history survives a track being removed
+    from disk (the NAS is read-only, but files do move).
+    """
+    __tablename__ = "play_events"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    track_id: Mapped[int] = mapped_column(ForeignKey("tracks.id"), index=True)
+    artist_name: Mapped[str] = mapped_column(String, default="", index=True)
+    album_title: Mapped[str] = mapped_column(String, default="")
+    track_title: Mapped[str] = mapped_column(String, default="")
+    started_at: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    ended_at: Mapped[int] = mapped_column(Integer, default=0)
+    # Wall-clock seconds this session actually lasted, and the furthest point
+    # reached — a 3s skip and a full listen are not the same event.
+    listened_ms: Mapped[int] = mapped_column(Integer, default=0)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    completed: Mapped[bool] = mapped_column(Boolean, default=False)
+    device: Mapped[str] = mapped_column(String, default="")
+    session_id: Mapped[str] = mapped_column(String, default="", index=True)
+
+
+Index("ix_uts_user_lastplayed", UserTrackState.user_id, UserTrackState.last_played_at)
+Index("ix_uts_user_playcount", UserTrackState.user_id, UserTrackState.play_count)
+Index("ix_pe_user_started", PlayEvent.user_id, PlayEvent.started_at)
+Index("ix_album_artist_title", Album.artist_id, Album.sort_title)
+Index("ix_track_album_disc_no", Track.album_id, Track.disc_no, Track.track_no)
+Index("ix_pli_playlist_pos", PlaylistItem.playlist_id, PlaylistItem.position)
+Index("ix_artist_lib_sort", Artist.library_id, Artist.sort_name)
+Index("ix_album_lib_sort", Album.library_id, Album.sort_title)
+Index("ix_track_lib", Track.library_id)
+
+
+class TrackLyrics(Base):
+    """Lyrics kept for SEARCH, not for display.
+
+    Display already works without this: /lyrics/{id} reads the sidecar or the
+    embedded tag per track, on demand. But "which song has this line in it"
+    cannot be answered one file at a time — tens of thousands of tag reads over NFS per query is
+    not a search, so the text has to sit in the database.
+
+    Only LOCAL sources are indexed (`.lrc`/`.txt` next to the file, or the
+    embedded tag). Anything fetched online is displayed but never written here:
+    the index would then be a copy of someone else's database, and a self-hosted
+    server should not quietly accumulate that.
+
+    `search_text` is the normalised copy that queries actually run against —
+    lowercased, accents folded, punctuation collapsed to single spaces — so
+    "dont stop" finds "Don't stop", which a raw LIKE never would.
+    """
+    __tablename__ = "track_lyrics"
+    track_id: Mapped[int] = mapped_column(ForeignKey("tracks.id"), primary_key=True)
+    library_id: Mapped[int] = mapped_column(Integer, index=True, default=0)
+    text: Mapped[str] = mapped_column(String, default="")
+    search_text: Mapped[str] = mapped_column(String, default="")
+    source: Mapped[str] = mapped_column(String, default="")   # sidecar.lrc | sidecar.txt | embedded
+    synced: Mapped[bool] = mapped_column(Boolean, default=False)
+    # When the file was last looked at, and its mtime then — so a re-index can
+    # skip everything untouched instead of re-reading the whole library.
+    indexed_at: Mapped[int] = mapped_column(Integer, default=0)
+    mtime: Mapped[float] = mapped_column(Float, default=0.0)
+    # A track with no local lyrics gets a row too, with empty text: without it
+    # every re-index would re-read the ~75% of the library that has none.
+    found: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+
+
+class OpenPlaylistItem(Base):
+    """Een nummer dat bij het importeren van een lijst nog niet in de
+    bibliotheek stond — met de plek die het in die lijst had.
+
+    Zonder dit was een geïmporteerde lijst voorgoed incompleet: zette je de
+    ontbrekende nummers later alsnog in de bibliotheek, dan stond er nergens
+    meer dat ze bij die lijst hoorden en op welke plek.
+
+    Nu wordt de plek bewaard. Na elke scan wordt gekeken of er inmiddels een
+    treffer is; zo ja, dan schuift het nummer op zijn oorspronkelijke positie de
+    lijst in. De nummers die er wél waren staan al op hún oorspronkelijke
+    positie, dus er zit een gat waar de rest in past — de volgorde van de
+    lijst die je plakte blijft precies zoals hij was.
+
+    Weg zodra het gelukt is. Blijft het te lang staan (het nummer komt er
+    niet bij), dan ruimt `los_openstaande` het na een maand op: een lijst die
+    een jaar later alsnog iets invoegt is griezelig, geen service.
+    """
+    __tablename__ = "open_playlist_items"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    playlist_id: Mapped[int] = mapped_column(ForeignKey("playlists.id"), index=True)
+    # De plek in de lijst zoals hij geplakt werd, niet de plek in wat er nu staat.
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    artist: Mapped[str] = mapped_column(String, default="")
+    title: Mapped[str] = mapped_column(String, default="")
+    # Wie de lijst importeerde — het nummer komt in ZIJN lijst terecht.
+    user_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    created_at: Mapped[int] = mapped_column(Integer, default=0, index=True)
+
+
+class DiagReport(Base):
+    """Een storingsmelding van de app.
+
+    Zie routers/diag.py voor het waarom. Hier staat alleen wat er nodig is om
+    een patroon te zien — toestel, versie, soort storing, foutmelding — en niets
+    over wat iemand luisterde of zocht.
+    """
+    __tablename__ = "diag_reports"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    # "fout", "vastloper" of "handmatig".
+    kind: Mapped[str] = mapped_column(String, default="fout", index=True)
+    message: Mapped[str] = mapped_column(String, default="")
+    stack: Mapped[str] = mapped_column(String, default="")
+    app_version: Mapped[str] = mapped_column(String, default="")
+    platform: Mapped[str] = mapped_column(String, default="", index=True)
+    model: Mapped[str] = mapped_column(String, default="", index=True)
+    os_version: Mapped[str] = mapped_column(String, default="")
+    # Op welk scherm het gebeurde, als de app dat wist.
+    scherm: Mapped[str] = mapped_column(String, default="")
+    extra: Mapped[str] = mapped_column(String, default="")
+    # Wanneer het gebeurde (klok van het toestel) en wanneer het binnenkwam.
+    at: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    created_at: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class MissedSearch(Base):
+    """Zoekopdrachten die niets opleverden — het verlanglijstje van een gebruiker.
+
+    Waarom dit bestaat: je merkt pas dat er iets ontbreekt op het moment dat je
+    het zoekt, en precies dan ben je het een minuut later weer vergeten. Deze
+    tabel onthoudt het.
+
+    Twee dingen die de lijst bruikbaar houden in plaats van een berg ruis:
+
+      * Zoeken gebeurt bij élke toetsaanslag, dus "b", "bo", "boh" komen alle
+        drie langs. Bij het opslaan wordt daarom eerst gekeken of er van deze
+        gebruiker al kort geleden een regel staat waarvan de ene tekst het begin
+        van de andere is; die wordt dan bijgewerkt naar de langste in plaats van
+        er een nieuwe naast te zetten.
+
+      * De lijst wordt bij het uitlezen opnieuw tegen de bibliotheek gehouden.
+        Staat het nummer er inmiddels in, dan verdwijnt de regel vanzelf — er is
+        geen knop om iets af te vinken en dus ook niets om te vergeten.
+    """
+    __tablename__ = "missed_searches"
+    __table_args__ = (UniqueConstraint("user_id", "query_norm", name="uq_user_missed_query"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    # Zoals de gebruiker het typte — dat is wat er in de lijst hoort te staan.
+    query: Mapped[str] = mapped_column(String(200))
+    # Kleine letters, ingekort; alleen om dubbele regels te herkennen.
+    query_norm: Mapped[str] = mapped_column(String(200), index=True)
+    hits: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[int] = mapped_column(Integer, default=0)
+    last_at: Mapped[int] = mapped_column(Integer, default=0, index=True)
+
+
+class ScanDir(Base):
+    """Per-directory mtime, so a quick scan can skip folders that cannot contain
+    anything new.
+
+    A directory's mtime changes whenever an entry is added, removed or renamed
+    inside it — which is exactly what "new music arrived" looks like. It does
+    NOT change when an existing file's contents are edited in place, so a quick
+    scan will not notice a retag; that is what a full scan is for.
+
+    Why this exists: deciding "nothing changed" used to cost one stat() per FILE.
+    On a large library (tens of thousands of files over NFS) that alone took ~290s on every scan.
+    Checking ~2k directory mtimes instead takes ~1.5s.
+
+    Lives in the writable data dir with the rest of the DB — never on the
+    read-only music mount.
+    """
+    __tablename__ = "scan_dirs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    library_id: Mapped[int] = mapped_column(Integer, index=True)
+    path: Mapped[str] = mapped_column(String, index=True)
+    mtime: Mapped[float] = mapped_column(Float, default=0.0)
+
+
+class BeheerLog(Base):
+    """Wat er in Beheer is veranderd, door wie en wanneer.
+
+    Gevuld door de middleware in logboek.py: elke wijzigende aanroep op een
+    beheerpad komt hier, met een samenvatting van wat er meegestuurd werd
+    (zonder wachtwoorden of sleutels).
+    """
+    __tablename__ = "beheer_log"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    at: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    methode: Mapped[str] = mapped_column(String, default="")
+    pad: Mapped[str] = mapped_column(String, default="")
+    status: Mapped[int] = mapped_column(Integer, default=0)
+    inhoud: Mapped[str] = mapped_column(String, default="")
+
+
+# ── Subsonic (routers/subsonic.py) ───────────────────────────────────────────
+class SubsonicKey(Base):
+    """Het app-wachtwoord waarmee iemand een Subsonic-app aan deze server koppelt.
+
+    Los van het gewone wachtwoord, en dat moet: de meeste Subsonic-apps loggen
+    in met `t = md5(wachtwoord + zout)`, en dat kan de server alleen narekenen
+    als hij het wachtwoord zelf kent. Het gewone wachtwoord staat er alleen als
+    pbkdf2-hash in. Dus krijgt iedereen die het wil een eigen, willekeurig
+    app-wachtwoord — net zo bewaard als de sessietokens, en net zo in te
+    trekken: weggooien en een nieuw maken.
+    """
+    __tablename__ = "subsonic_keys"
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    secret: Mapped[str] = mapped_column(String, index=True)
+    created_at: Mapped[int] = mapped_column(Integer, default=0)
+    last_used_at: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class SubsonicStar(Base):
+    """Een ster op een album of artiest, vanuit een Subsonic-app.
+
+    Een ster op een NUMMER is gewoon een like en gaat naar "Liked Songs" (zie
+    likes.py) — dan ziet de JLTamp-app hem ook. Albums en artiesten liken kent
+    JLTamp zelf niet; die sterren staan hier, zodat "favoriete albums" in zo'n
+    app niet bij elke herstart leeg is.
+    """
+    __tablename__ = "subsonic_stars"
+    __table_args__ = (UniqueConstraint("user_id", "kind", "item_id", name="uq_subsonic_star"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    kind: Mapped[str] = mapped_column(String, default="")      # "album" | "artist"
+    item_id: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[int] = mapped_column(Integer, default=0)

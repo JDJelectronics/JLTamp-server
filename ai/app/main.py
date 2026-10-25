@@ -1,0 +1,442 @@
+"""HTTP surface — the exact endpoints frontend/src/services/aiService.ts calls.
+
+The app discovers this service by probing port 5000 across the tailnet/LAN and
+then talks to /health, /whoami, /ai/playlist, /ai/status and /ai/suggest. Those
+paths and response shapes are a contract with a shipped Android build: changing
+them breaks installed apps, so they stay as they are.
+
+What did change is who may call them. The previous version bound 0.0.0.0 with
+`CORS(*)` and no authentication, which let any page in any browser on the
+network drive it.
+"""
+from __future__ import annotations
+
+import faulthandler
+import signal
+import subprocess
+import threading as _threading
+import time as _time
+
+# SIGUSR1 dumps every thread's stack to stderr — the definitive
+# way to see where a hang actually is, no root needed.
+faulthandler.register(signal.SIGUSR1, all_threads=True)
+
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+
+from . import config
+from . import redenen as reden_opslag
+from .engine import Engine
+from .jobs import JobManager
+
+app = Flask(__name__)
+
+# Wildcard CORS would undo the API key for browser clients, so origins must be
+# named explicitly. With none configured, cross-origin requests are refused and
+# only native (non-browser) clients can reach the service.
+if config.CORS_ORIGINS:
+    CORS(app, origins=config.CORS_ORIGINS)
+
+engine = Engine()
+jobs = JobManager(max_jobs=config.MAX_JOBS, timeout=config.JOB_TIMEOUT_SEC)
+
+# Discovery has to work before the client can authenticate, so /health and
+# /whoami stay open. They expose no library data.
+OPEN_PATHS = {"/health", "/ai/health", "/whoami"}
+
+
+@app.before_request
+def _authenticate():
+    # When every caller must present their own JLTamp token, that token *is*
+    # the authentication and the endpoints check it themselves. Demanding a
+    # shared key on top would mean shipping a second secret to every client —
+    # one the app has no way to know.
+    if config.REQUIRE_USER_TOKEN:
+        return None
+    if not config.API_KEY or request.path in OPEN_PATHS or request.method == "OPTIONS":
+        return None
+    supplied = (request.headers.get("X-AI-Key")
+                or request.args.get("key")
+                or "")
+    if supplied != config.API_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+    return None
+
+
+# Cached, because computing it forks a subprocess. Forking from a request
+# thread while another thread runs numpy (a weekly build, say) is the classic
+# multithreaded-fork deadlock: the child inherits a held malloc lock and hangs,
+# and the parent blocks forever in _execute_child. /health is called often and
+# the address never changes, so fork once and reuse — the hot path never forks.
+_ts_ip: str | None = None
+_ts_ip_at = 0.0
+_ts_lock = _threading.Lock()
+_TS_TTL = 3600
+
+
+def _tailscale_ip() -> str | None:
+    global _ts_ip, _ts_ip_at
+    now = _time.time()
+    if _ts_ip is not None and now - _ts_ip_at < _TS_TTL:
+        return _ts_ip
+    # One fork at a time, and never while holding up other requests longer
+    # than necessary — a stale value is fine until the refresh completes.
+    if not _ts_lock.acquire(blocking=False):
+        return _ts_ip
+    try:
+        out = subprocess.check_output(["/usr/bin/tailscale", "ip", "-4"],
+                                      text=True, timeout=5)
+        _ts_ip = next((l.strip() for l in out.splitlines()
+                       if l.strip().startswith("100.")), None)
+        _ts_ip_at = now
+    except (OSError, subprocess.SubprocessError):
+        pass
+    finally:
+        _ts_lock.release()
+    return _ts_ip
+
+
+# Two paths, one handler. When the service is reached directly, /health is the
+# natural spot and shipped app builds already call it. When it is proxied under
+# a JLTamp hostname only /ai/* is routed here, so /health there would hit
+# JLTamp's own server instead — hence the alias.
+@app.get("/health")
+@app.get("/ai/health")
+def health():
+    data = engine.health()
+    data["tailscale_ip"] = _tailscale_ip()
+    data["jobs"] = jobs.stats()
+    return jsonify(data)
+
+
+@app.get("/whoami")
+def whoami():
+    return jsonify({"tailscale_ip": _tailscale_ip()})
+
+
+@app.get("/ai/suggest")
+def suggest():
+    # Kort en zoals iemand het intypt, niet als een folder. Elk voorbeeld is
+    # tegen de echte bibliotheek getoetst, want een suggestie die niets goeds
+    # oplevert is erger dan een saaie: een sfeerzin ("zaterdagochtend, koffie,
+    # niks moeten") wordt door de tekstmatching gekaapt door nummers die die
+    # wóórden in de titel hebben. Genre, tijdvak, artiest en tempo werken wel.
+    return jsonify({"suggestions": [
+        "afbouwen tot ik in slaap val",
+        "wakker worden zonder te schrikken",
+        "feestboog: opbouwen en weer afbouwen",
+        "intervaltraining: 4 hard, 2 rustig, 40 minuten",
+        "de leukste van Queen",
+        "iets zoals Queen, maar niet Queen",
+        "gewoon metal",
+        "hardrock uit de jaren 80",
+        "jaren 90 hiphop",
+        "rustige jazz",
+        "klassiek, alleen piano",
+        "nederpop",
+    ]})
+
+
+def _caller_token() -> str:
+    """The caller's own JLTamp session token, however the app sent it.
+
+    aiService.ts already holds this token to talk to JLTamp; reusing it here
+    means the AI needs no separate credential, and can act as the person who
+    actually asked rather than as one shared account.
+    """
+    auth = request.headers.get("Authorization", "")
+    bearer = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    return (request.headers.get("X-Plex-Token")
+            or bearer
+            or request.args.get("X-Plex-Token", "")).strip()
+
+
+@app.post("/ai/playlist")
+def playlist():
+    body = request.get_json(silent=True) or {}
+    prompt = (body.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({"error": "prompt is leeg"}), 400
+
+    token = _caller_token()
+    if config.REQUIRE_USER_TOKEN:
+        # Reachable from the internet: every caller must prove who they are,
+        # and JLTamp is the authority on that.
+        ctx = engine.user_context(token)
+        if not ctx:
+            return jsonify({"error": "ongeldig of ontbrekend JLTamp-token"}), 401
+
+    # The duplicate guard is per user: two people asking for "chill muziek"
+    # want two playlists, in their own libraries.
+    guard = f"{token[:12]}:{prompt.lower()}"
+
+    running = jobs.existing(guard)
+    if running:
+        return jsonify({"status": "already_running", "job_id": running,
+                        "poll_interval": 1000, "timeout": config.JOB_TIMEOUT_SEC * 1000})
+
+    if jobs.full():
+        return jsonify({"error": "server busy, probeer het zo opnieuw"}), 429
+
+    job_id = jobs.submit(guard, lambda _g: engine.handle(prompt, token))
+    return jsonify({"status": "processing", "job_id": job_id,
+                    "poll_interval": 1000, "timeout": config.JOB_TIMEOUT_SEC * 1000})
+
+
+@app.post("/ai/foryou")
+def foryou():
+    """Een persoonlijke mix uit het smaakprofiel van de aanroeper (geen prompt).
+    Async job, net als /ai/playlist — de client pollt /ai/status."""
+    token = _caller_token()
+    if config.REQUIRE_USER_TOKEN and not engine.user_context(token):
+        return jsonify({"error": "ongeldig of ontbrekend JLTamp-token"}), 401
+    guard = f"{token[:12]}:foryou"
+    running = jobs.existing(guard)
+    if running:
+        return jsonify({"status": "already_running", "job_id": running,
+                        "poll_interval": 1000, "timeout": config.JOB_TIMEOUT_SEC * 1000})
+    if jobs.full():
+        return jsonify({"error": "server busy, probeer het zo opnieuw"}), 429
+    job_id = jobs.submit(guard, lambda _g: engine.foryou(token))
+    return jsonify({"status": "processing", "job_id": job_id,
+                    "poll_interval": 1000, "timeout": config.JOB_TIMEOUT_SEC * 1000})
+
+
+@app.post("/ai/moment")
+def moment():
+    """🕒 Voor nu — een mix bij dit moment van de dag en de week.
+
+    Body: {"uur": 0-23, "dag": 0-6 (0 = maandag), "tz": getTimezoneOffset()}.
+    Het toestel stuurt zijn eigen klok mee: de server weet niet waar je bent.
+    Async job, net als /ai/foryou — de client pollt /ai/status."""
+    token = _caller_token()
+    if config.REQUIRE_USER_TOKEN and not engine.user_context(token):
+        return jsonify({"error": "ongeldig of ontbrekend JLTamp-token"}), 401
+    body = request.get_json(silent=True) or {}
+
+    def getal(naam: str, standaard: int | None = None) -> int | None:
+        try:
+            return int(body[naam]) if body.get(naam) is not None else standaard
+        except (TypeError, ValueError):
+            return standaard
+
+    uur, dag, tz = getal("uur"), getal("dag"), getal("tz", 0) or 0
+    guard = f"{token[:12]}:moment"
+    running = jobs.existing(guard)
+    if running:
+        return jsonify({"status": "already_running", "job_id": running,
+                        "poll_interval": 1000, "timeout": config.JOB_TIMEOUT_SEC * 1000})
+    if jobs.full():
+        return jsonify({"error": "server busy, probeer het zo opnieuw"}), 429
+    job_id = jobs.submit(guard, lambda _g: engine.moment(token, uur, dag, tz))
+    return jsonify({"status": "processing", "job_id": job_id,
+                    "poll_interval": 1000, "timeout": config.JOB_TIMEOUT_SEC * 1000})
+
+
+@app.post("/ai/samen")
+def samen():
+    """👥 Samen — een mix die tussen iedereen in een Listen Together-sessie in ligt.
+
+    Body: {"code": "ABC123"}. Alleen de host van die sessie; de engine controleert
+    dat zelf. Async job, net als /ai/foryou — de client pollt /ai/status."""
+    token = _caller_token()
+    if not engine.user_context(token):
+        return jsonify({"error": "ongeldig of ontbrekend JLTamp-token"}), 401
+    body = request.get_json(silent=True) or {}
+    code = str(body.get("code") or "").strip()
+    if not code:
+        return jsonify({"error": "sessiecode ontbreekt"}), 400
+    guard = f"{token[:12]}:samen"
+    running = jobs.existing(guard)
+    if running:
+        return jsonify({"status": "already_running", "job_id": running,
+                        "poll_interval": 1000, "timeout": config.JOB_TIMEOUT_SEC * 1000})
+    if jobs.full():
+        return jsonify({"error": "server busy, probeer het zo opnieuw"}), 429
+    job_id = jobs.submit(guard, lambda _g: engine.samen(token, code))
+    return jsonify({"status": "processing", "job_id": job_id,
+                    "poll_interval": 1000, "timeout": config.JOB_TIMEOUT_SEC * 1000})
+
+
+# De weeklijsten lopen alle gebruikers langs en duren minuten. Op een eigen
+# thread, zodat ze niet zo lang een van de acht verzoek-threads van waitress
+# bezet houden — of tegen diens channel_timeout van 120 s aanlopen. Wie ze
+# start, vraagt daarna GET /ai/weekly tot de status niet meer "running" is.
+_weekly_lock = _threading.Lock()
+_weekly_state: dict = {"status": "idle"}
+
+
+def _is_admin() -> bool:
+    ctx = engine.user_context(_caller_token())
+    return bool(ctx and (ctx["user"].get("isAdmin") or ctx["user"].get("is_admin")))
+
+
+def _run_weekly(only: int | None) -> None:
+    try:
+        results = engine.generate_weekly(only_user_id=only)
+        state = {"status": "done", "results": results}
+    except Exception as e:                                  # noqa: BLE001
+        print(f"❌ weeklijsten mislukt: {e}")
+        state = {"status": "error", "message": str(e)}
+    with _weekly_lock:
+        _weekly_state.update(state, finished_at=_time.time())
+
+
+@app.post("/ai/weekly")
+def weekly():
+    """Start the weekly per-user playlists. Admin token required — this acts on
+    every user's library, so it must not be open to any caller. Returns at once;
+    poll GET /ai/weekly for the outcome per user."""
+    if not _is_admin():
+        return jsonify({"error": "admin token required"}), 403
+    only = request.args.get("user_id", type=int)
+    with _weekly_lock:
+        if _weekly_state.get("status") == "running":
+            return jsonify(dict(_weekly_state))
+        _weekly_state.clear()
+        _weekly_state.update(status="running", started_at=_time.time(), user_id=only)
+    _threading.Thread(target=_run_weekly, args=(only,), daemon=True).start()
+    return jsonify({"status": "running"})
+
+
+@app.get("/ai/weekly")
+def weekly_status():
+    """Where the weekly build is: idle, running, done (with results) or error."""
+    if not _is_admin():
+        return jsonify({"error": "admin token required"}), 403
+    with _weekly_lock:
+        return jsonify(dict(_weekly_state))
+
+
+# ✨ Nieuw voor jou. Loopt vanzelf na een verversing met nieuwe muziek; dit is om
+# hem met de hand te draaien: POST /ai/nieuw?dagen=7 (optioneel &user_id=N).
+_nieuw_lock = _threading.Lock()
+_nieuw_run: dict = {"status": "idle"}
+
+
+def _run_nieuw(only: int | None, dagen: int) -> None:
+    try:
+        state = {"status": "done", "results": engine.generate_nieuw(only_user_id=only, dagen=dagen)}
+    except Exception as e:                                  # noqa: BLE001
+        print(f"❌ Nieuw voor jou mislukt: {e}")
+        state = {"status": "error", "message": str(e)}
+    with _nieuw_lock:
+        _nieuw_run.update(state, finished_at=_time.time())
+
+
+@app.post("/ai/nieuw")
+def nieuw():
+    if not _is_admin():
+        return jsonify({"error": "admin token required"}), 403
+    only = request.args.get("user_id", type=int)
+    dagen = request.args.get("dagen", default=7, type=int)
+    with _nieuw_lock:
+        if _nieuw_run.get("status") == "running":
+            return jsonify(dict(_nieuw_run))
+        _nieuw_run.clear()
+        _nieuw_run.update(status="running", started_at=_time.time(), user_id=only, dagen=dagen)
+    _threading.Thread(target=_run_nieuw, args=(only, dagen), daemon=True).start()
+    return jsonify({"status": "running"})
+
+
+@app.get("/ai/nieuw")
+def nieuw_status():
+    if not _is_admin():
+        return jsonify({"error": "admin token required"}), 403
+    with _nieuw_lock:
+        return jsonify(dict(_nieuw_run))
+
+
+@app.post("/ai/radio")
+def radio():
+    """Next batch of an endless station seeded by a track or artist.
+
+    Body: {"seed": "t123" | "Adele", "exclude": ["t1", ...], "count": 20}.
+    The client keeps calling with a growing `exclude` to keep its queue full.
+    """
+    token = _caller_token()
+    if config.REQUIRE_USER_TOKEN and not engine.user_context(token):
+        return jsonify({"error": "ongeldig of ontbrekend JLTamp-token"}), 401
+    body = request.get_json(silent=True) or {}
+    seed = body.get("seed")
+    seed = seed.strip() if isinstance(seed, str) else seed
+    if not seed:
+        return jsonify({"error": "seed is leeg"}), 400
+    exclude = set(str(x) for x in (body.get("exclude") or []))
+    dislike = [str(x) for x in (body.get("dislike") or [])]
+    count = min(int(body.get("count") or 20), 50)
+    # "Rustiger" (-1) of "energieker" (+1), vanuit de knoppen in de speler.
+    try:
+        energie = max(-1, min(1, int(body.get("energie") or 0)))
+    except (TypeError, ValueError):
+        energie = 0
+    return jsonify(engine.radio(seed, exclude, count, dislike=dislike, token=token,
+                                energie=energie))
+
+
+@app.get("/ai/genres")
+def genres_lijst():
+    """📻 De genres voor radio op genre: opgeschoonde groepen, met hoeveel nummers
+    je ervan mag afspelen en hoeveel van jouw favorieten erin zitten."""
+    token = _caller_token()
+    if config.REQUIRE_USER_TOKEN and not engine.user_context(token):
+        return jsonify({"error": "ongeldig of ontbrekend JLTamp-token"}), 401
+    return jsonify(engine.genres(token))
+
+
+@app.get("/ai/redenen")
+def redenen():
+    """Waarom dit nummer? — {ratingKey: reden} voor een lijst die de AI maakte.
+
+    Alleen voor wie die lijst mag zien, en dat beslist JLTamp zelf: we vragen de
+    lijst op met het token van de beller. Wie een willekeurig lijstnummer
+    probeert, krijgt niets — er staan iemands favorieten in.
+    """
+    ctx = engine.user_context(_caller_token())
+    if not ctx:
+        return jsonify({"error": "ongeldig of ontbrekend JLTamp-token"}), 401
+    rk = (request.args.get("playlist") or "").strip()
+    if not rk:
+        return jsonify({"error": "playlist ontbreekt"}), 400
+    try:
+        ctx["client"]._get(f"/playlists/{rk}")
+    except Exception:                                   # noqa: BLE001
+        return jsonify({"redenen": {}}), 404
+    return jsonify({"redenen": reden_opslag.lees(rk)})
+
+
+@app.get("/ai/status")
+def status():
+    job = jobs.get(request.args.get("job_id", ""))
+    if not job:
+        return jsonify({"error": "job not found"}), 404
+    # The app reads the playlist name off the top level of a finished job.
+    if job.get("status") == "done" and isinstance(job.get("result"), dict):
+        job = {**job, **job["result"]}
+    return jsonify(job)
+
+
+def main() -> None:
+    if not config.API_KEY:
+        print("⚠️  AI_API_KEY is not set — this service is unauthenticated. "
+              "Fine on a private tailnet, risky on a shared LAN.")
+    engine.start()
+    print(f"🎧 JLTamp AI on {config.HOST}:{config.PORT} → {config.JLTAMP_URL}")
+
+    # Flask's built-in server is single-process and explicitly not for
+    # production. Waitress is a real WSGI server and pure Python, so it
+    # installs on the Jetson without a build step.
+    try:
+        from waitress import serve
+    except ImportError:
+        print("⚠️  waitress not installed — falling back to Flask's development "
+              "server. Install it with: pip3 install waitress")
+        app.run(host=config.HOST, port=config.PORT, threaded=True)
+        return
+    serve(app, host=config.HOST, port=config.PORT, threads=8,
+          # Prompt jobs return immediately; only /health should ever be slow.
+          channel_timeout=120, ident="JLTamp AI")
+
+
+if __name__ == "__main__":
+    main()

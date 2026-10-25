@@ -1,0 +1,5 @@
+flask>=3.0
+flask-cors>=4.0
+requests>=2.31
+numpy>=1.24
+waitress>=2.1

@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#120c1f">
+<title>Raad het nummer</title>
+<!--
+  De spelerspagina van "Raad het nummer, samen" (routers/spel.py), op
+  /spel/<token>. Voor wie meedoet zonder app of account.
+
+  Alles in dit ene bestand, niets van buiten geladen. Tekst van de server gaat
+  via textContent de pagina in, nooit via innerHTML: een bijnaam of titel is
+  invoer van een vreemde.
+-->
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #120c1f;
+    --kaart: rgba(255,255,255,0.06);
+    --rand: rgba(255,255,255,0.1);
+    --tekst: #f4f2f8;
+    --zacht: #b3abc4;
+    --accent: #b388ff;
+    --goed: #2fbf71;
+    --fout: #e05555;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: var(--bg); color: var(--tekst); }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh; min-height: 100dvh;
+    background:
+      radial-gradient(120% 60% at 50% -10%, rgba(179,136,255,0.28), transparent 60%),
+      radial-gradient(80% 50% at 100% 100%, rgba(255,95,162,0.14), transparent 60%),
+      var(--bg);
+    background-attachment: fixed;
+  }
+  .wrap { max-width: 520px; margin: 0 auto; padding: calc(16px + env(safe-area-inset-top)) 16px calc(24px + env(safe-area-inset-bottom)); min-height: 100dvh; display: flex; flex-direction: column; }
+  header { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  header h1 { margin: 0; font-size: 19px; font-weight: 800; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pil { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 999px; background: var(--kaart); border: 1px solid var(--rand); font-weight: 800; font-variant-numeric: tabular-nums; }
+  .vak { flex: 1; display: flex; flex-direction: column; }
+  .midden { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; gap: 10px; padding: 20px 0; }
+  .groot { font-size: 64px; line-height: 1; }
+  h2 { margin: 0; font-size: 24px; font-weight: 900; }
+  p { margin: 0; color: var(--zacht); }
+  .ronde { color: var(--zacht); font-size: 12px; font-weight: 800; letter-spacing: 1.6px; text-transform: uppercase; text-align: center; margin: 4px 0 10px; }
+  .balk { height: 6px; border-radius: 3px; background: rgba(255,255,255,0.1); overflow: hidden; margin-bottom: 14px; }
+  .balk div { height: 100%; background: var(--accent); transition: width .9s linear; }
+  .keuzes { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; flex: 1; max-height: 520px; }
+  button { font: inherit; color: inherit; border: none; cursor: pointer; }
+  .keuze { border-radius: 18px; padding: 14px 12px; text-align: left; display: flex; flex-direction: column; justify-content: flex-end; min-height: 120px; color: #fff; transition: transform .1s, opacity .2s; position: relative; overflow: hidden; }
+  .keuze:active { transform: scale(0.97); }
+  .keuze .t { font-weight: 800; font-size: 17px; line-height: 1.2; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+  .keuze .a { font-size: 13px; opacity: 0.85; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .keuze .vorm { position: absolute; top: 12px; left: 12px; width: 26px; height: 26px; opacity: 0.9; }
+  .k0 { background: linear-gradient(150deg, #e2475b, #b8243b); }
+  .k1 { background: linear-gradient(150deg, #3b7cf0, #2456c4); }
+  .k2 { background: linear-gradient(150deg, #e9a21a, #c27a06); }
+  .k3 { background: linear-gradient(150deg, #2fae69, #1d8a4f); }
+  .keuzes.dicht .keuze:not(.mijn) { opacity: 0.3; }
+  .keuze.mijn { outline: 3px solid #fff; outline-offset: -3px; }
+  .keuze.goed { outline: 4px solid #fff; opacity: 1 !important; }
+  .lijst { width: 100%; background: var(--kaart); border: 1px solid var(--rand); border-radius: 18px; padding: 6px 14px; text-align: left; }
+  .rij { display: flex; align-items: center; gap: 10px; padding: 9px 0; }
+  .rij + .rij { border-top: 1px solid rgba(255,255,255,0.06); }
+  .rij .plek { width: 26px; font-weight: 900; color: var(--zacht); }
+  .rij .foto { width: 28px; height: 28px; border-radius: 50%; object-fit: cover; flex: none; background: rgba(255,255,255,0.1); }
+  .rij .foto.letter { display: inline-flex; align-items: center; justify-content: center; background: var(--accent); color: #1a0d33; font-weight: 900; font-size: 13px; }
+  .rij .wie { flex: 1; min-width: 0; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .rij .erbij { color: var(--goed); font-weight: 800; font-size: 13px; }
+  .rij .pt { font-weight: 900; font-variant-numeric: tabular-nums; }
+  .rij.ik { color: var(--accent); }
+  .laag { position: fixed; inset: 0; background: rgba(10,6,18,0.86); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); display: flex; align-items: center; justify-content: center; padding: 20px; z-index: 30; }
+  .laag[hidden] { display: none; }
+  .laag .kaart { width: 100%; max-width: 380px; padding: 24px; text-align: center; background: #1c1430; border: 1px solid var(--rand); border-radius: 22px; }
+  .laag h3 { margin: 6px 0 6px; font-size: 24px; }
+  .laag p { margin: 0 0 16px; }
+  input { width: 100%; height: 52px; border-radius: 14px; border: 1px solid var(--rand); background: rgba(255,255,255,0.07); color: var(--tekst); padding: 0 16px; font-size: 18px; outline: none; text-align: center; }
+  input:focus { border-color: var(--accent); }
+  .knop { width: 100%; height: 52px; margin-top: 12px; border-radius: 26px; background: var(--accent); color: #1a0d33; font-weight: 900; font-size: 17px; }
+  .knop:disabled { opacity: 0.5; }
+  .fout { color: #ff8a8a; font-size: 14px; min-height: 18px; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1 id="naam">Raad het nummer</h1>
+    <span class="pil" id="mijnPunten" hidden>★ <span id="pt">0</span></span>
+  </header>
+  <div class="vak" id="vak"></div>
+</div>
+
+<div class="laag" id="aanmelden" hidden>
+  <div class="kaart">
+    <div class="groot">🎵</div>
+    <h3>Doe mee!</h3>
+    <p id="aanmeldUitleg">Kies een bijnaam. De anderen zien die in de stand.</p>
+    <input id="bijnaam" maxlength="18" autocomplete="nickname" enterkeyhint="go" placeholder="Bijnaam">
+    <button class="knop" id="meedoen">Meedoen</button>
+    <div class="fout" id="aanmeldFout"></div>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+  const token = location.pathname.split('/').filter(Boolean)[1] || '';
+  const basis = `/spel/${encodeURIComponent(token)}`;
+  const SLEUTEL = `jltamp.spel.${token}`;
+  let speler = null;
+  try { speler = localStorage.getItem(SLEUTEL); } catch (_) {}
+  let stand = null;
+  let getekend = '';
+  let klok = null;
+
+  const el = (tag, cls, tekst) => {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (tekst != null) e.textContent = String(tekst);
+    return e;
+  };
+  const $ = (id) => document.getElementById(id);
+  const tril = (ms) => { try { navigator.vibrate && navigator.vibrate(ms); } catch (_) {} };
+
+  // Vormen in de hoeken, zoals bij een echte kwis: ook zonder kleuren te zien
+  // welke knop welke is.
+  const VORMEN = [
+    '<svg viewBox="0 0 24 24" class="vorm"><path fill="#fff" d="M12 3 22 20H2z"/></svg>',
+    '<svg viewBox="0 0 24 24" class="vorm"><path fill="#fff" d="M12 2 22 12 12 22 2 12z"/></svg>',
+    '<svg viewBox="0 0 24 24" class="vorm"><circle fill="#fff" cx="12" cy="12" r="10"/></svg>',
+    '<svg viewBox="0 0 24 24" class="vorm"><rect fill="#fff" x="3" y="3" width="18" height="18" rx="2"/></svg>',
+  ];
+
+  async function vraag(pad, opties = {}) {
+    const headers = { 'Content-Type': 'application/json' };
+    if (speler) headers['X-Spel-Speler'] = speler;
+    const r = await fetch(basis + pad, { method: opties.method || 'GET', headers, body: opties.body ? JSON.stringify(opties.body) : undefined, cache: 'no-store' });
+    let data = null;
+    try { data = await r.json(); } catch (_) {}
+    if (!r.ok) { const e = new Error((data && data.detail) || 'Er ging iets mis'); e.status = r.status; throw e; }
+    return data;
+  }
+
+  function ranglijst(rij, ikNaam, metErbij) {
+    const l = el('div', 'lijst');
+    rij.forEach((p, i) => {
+      const r = el('div', 'rij' + (p.bijnaam === ikNaam ? ' ik' : ''));
+      r.append(el('span', 'plek', i < 3 ? ['🥇', '🥈', '🥉'][i] : i + 1));
+      // Profielfoto als die er is (alleen een pad op deze server), anders de eerste letter.
+      if (p.foto && /^\/users\/\d+\/thumb$/.test(p.foto)) {
+        const img = el('img', 'foto'); img.src = p.foto; img.alt = ''; r.append(img);
+      } else {
+        r.append(el('span', 'foto letter', (p.bijnaam || '?').trim().charAt(0).toUpperCase()));
+      }
+      r.append(el('span', 'wie', p.bijnaam));
+      if (metErbij && p.erbij) r.append(el('span', 'erbij', '+' + p.erbij));
+      r.append(el('span', 'pt', p.punten));
+      l.append(r);
+    });
+    return l;
+  }
+
+  function teken() {
+    const s = stand;
+    if (!s) return;
+    $('naam').textContent = s.naam ? `Raad het nummer · ${s.naam}` : 'Raad het nummer';
+    const ik = s.ik;
+    $('mijnPunten').hidden = !ik;
+    if (ik) $('pt').textContent = ik.punten;
+    $('aanmelden').hidden = !!ik;
+
+    // Alleen opnieuw opbouwen als er echt iets veranderde (de klok niet meegerekend).
+    const sleutel = JSON.stringify([s.fase, s.ronde, s.gekozen, s.goed, s.spelers, ik && ik.punten, s.ranglijst]);
+    if (sleutel === getekend) { zetKlok(); return; }
+    getekend = sleutel;
+    const vak = $('vak');
+    vak.replaceChildren();
+
+    if (s.fase === 'wacht') {
+      const m = el('div', 'midden');
+      m.append(el('div', 'groot', '🎧'));
+      m.append(el('h2', null, ik ? `Je doet mee, ${ik.bijnaam}!` : 'Bijna klaar…'));
+      m.append(el('p', null, `Wachten tot ${s.naam || 'de gastheer'} begint. ${s.spelers} ${s.spelers === 1 ? 'speler' : 'spelers'} binnen.`));
+      if (s.ranglijst.length) m.append(ranglijst(s.ranglijst, ik && ik.bijnaam, false));
+      vak.append(m);
+    } else if (s.fase === 'ronde') {
+      vak.append(el('div', 'ronde', s.rondes ? `Ronde ${s.ronde} van ${s.rondes}` : `Ronde ${s.ronde}`));
+      const b = el('div', 'balk'); b.append(el('div')); b.id = 'balk'; vak.append(b);
+      const k = el('div', 'keuzes' + (s.gekozen != null ? ' dicht' : ''));
+      s.opties.forEach((o, i) => {
+        const knop = el('button', `keuze k${i % 4}` + (s.gekozen === i ? ' mijn' : ''));
+        knop.insertAdjacentHTML('beforeend', VORMEN[i % 4]);
+        knop.append(el('span', 't', o.titel));
+        if (o.artiest) knop.append(el('span', 'a', o.artiest));
+        knop.disabled = s.gekozen != null;
+        knop.addEventListener('click', () => kies(i));
+        k.append(knop);
+      });
+      vak.append(k);
+      if (s.gekozen != null) {
+        const w = el('p', null, 'Gekozen! Even wachten op de rest…');
+        w.style.textAlign = 'center'; w.style.marginTop = '14px';
+        vak.append(w);
+      }
+      zetKlok();
+    } else if (s.fase === 'uitslag' || s.fase === 'einde') {
+      const m = el('div', 'midden');
+      if (s.fase === 'uitslag') {
+        const goed = s.gekozen != null && s.gekozen === s.goed;
+        m.append(el('div', 'groot', goed ? '🎉' : s.gekozen == null ? '⏰' : '😬'));
+        m.append(el('h2', null, goed ? `Goed! +${ik ? ik.erbij : 0}` : s.gekozen == null ? 'Te laat!' : 'Helaas!'));
+        const juist = s.opties[s.goed];
+        if (juist) m.append(el('p', null, `Het was “${juist.titel}”${juist.artiest ? ' van ' + juist.artiest : ''}`));
+        if (ik && ik.reeks >= 3) m.append(el('p', null, `🔥 ${ik.reeks} op rij`));
+        if (goed) tril([30, 40, 30]); else tril(120);
+      } else {
+        const plek = ik ? ik.plek : 0;
+        m.append(el('div', 'groot', plek === 1 ? '🏆' : plek === 2 ? '🥈' : plek === 3 ? '🥉' : '🎵'));
+        m.append(el('h2', null, ik ? `Je werd ${plek}e!` : 'Afgelopen'));
+        m.append(el('p', null, ik ? `${ik.punten} punten` : ''));
+      }
+      if (s.ranglijst.length) m.append(ranglijst(s.ranglijst, ik && ik.bijnaam, s.fase === 'uitslag'));
+      vak.append(m);
+    }
+  }
+
+  function zetKlok() {
+    const b = document.querySelector('#balk div');
+    if (!b || !stand) return;
+    b.style.width = `${Math.max(0, Math.min(100, (stand.over / (stand.duur || 30)) * 100))}%`;
+  }
+
+  async function kies(i) {
+    if (!stand || stand.gekozen != null) return;
+    tril(25);
+    stand.gekozen = i;
+    teken();
+    try { stand = await vraag('/antwoord', { method: 'POST', body: { ronde: stand.ronde, keuze: i } }); teken(); }
+    catch (_) { /* de volgende stand laat zien hoe het zit */ }
+  }
+
+  function eindScherm(tekst) {
+    clearTimeout(klok);
+    $('aanmelden').hidden = true;
+    const vak = $('vak');
+    vak.replaceChildren();
+    const m = el('div', 'midden');
+    m.append(el('div', 'groot', '👋'));
+    m.append(el('h2', null, tekst));
+    vak.append(m);
+  }
+
+  async function ververs() {
+    try {
+      stand = await vraag('/stand');
+      teken();
+    } catch (e) {
+      if (e.status === 404 || e.status === 410) { eindScherm(e.message); return; }
+    }
+    const snel = stand && stand.fase === 'ronde';
+    klok = setTimeout(ververs, snel ? 700 : 1500);
+  }
+
+  async function meedoen() {
+    const naam = $('bijnaam').value.trim();
+    $('aanmeldFout').textContent = '';
+    if (naam.length < 2) { $('aanmeldFout').textContent = 'Minstens twee tekens.'; return; }
+    $('meedoen').disabled = true;
+    try {
+      const r = await vraag('/speler', { method: 'POST', body: { bijnaam: naam } });
+      speler = r.speler;
+      try { localStorage.setItem(SLEUTEL, speler); } catch (_) {}
+      stand = r; getekend = ''; teken();
+    } catch (e) {
+      $('aanmeldFout').textContent = e.message;
+    } finally {
+      $('meedoen').disabled = false;
+    }
+  }
+
+  $('meedoen').addEventListener('click', meedoen);
+  $('bijnaam').addEventListener('keydown', (e) => { if (e.key === 'Enter') meedoen(); });
+  ververs();
+})();
+</script>
+</body>
+</html>
